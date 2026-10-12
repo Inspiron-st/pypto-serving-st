@@ -531,7 +531,9 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
 
     def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
         """Allocate one worker-resident KV cache tensor shared by prefill/decode."""
-        return self._shared_l3_worker().alloc_tensor(shape, dtype)
+        # Attention reads full KV pages: zero weights cannot suppress NaNs
+        # left in the unused value-page tail (0 * NaN is NaN).
+        return self._shared_l3_worker().alloc_tensor(shape, dtype, init=torch.zeros(shape, dtype=dtype))
 
     def _free_kv_cache_tensor(self, tensor: DeviceTensor) -> None:
         """Release one worker-resident KV cache tensor."""
