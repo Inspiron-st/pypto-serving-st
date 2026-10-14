@@ -6,7 +6,7 @@ Install PyPTO Serving from a source checkout. The package does not vendor the As
 
 Prepare a Linux host with Ascend NPUs visible to the serving user, an Ascend-compatible Python 3.10+ environment, CANN, PyPTO runtime pieces, PyTorch, and the model checkpoint you plan to run.
 
-Qwen3-14B expects a local Hugging Face style checkpoint directory containing `config.json`, tokenizer files, and weight shards. DeepSeek V4 serving expects a converted W8A8 compressed-tensors checkpoint and exactly eight device IDs with `--dp 8 --ep 8 --tp 1`.
+Checkpoint format and device requirements depend on the model. See the [Qwen3-14B](../models/qwen3-14b.md#checkpoint) and [DeepSeek V4](../models/deepseek-v4/index.md) guides for the currently supported paths.
 
 ## Clone
 

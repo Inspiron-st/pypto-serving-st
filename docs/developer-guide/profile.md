@@ -4,6 +4,8 @@ The `pypto_serving.tools.profile` module records serving and generation activity
 
 Each process writes to a separate JSON Lines fragment. This avoids cross-process writes to one file and preserves the events that were flushed if a run exits before the final merge. On a normal shutdown, the entry points merge the fragments into a single `trace.json` file that can be opened in a trace viewer such as [Perfetto](https://ui.perfetto.dev/).
 
+Profiling explains where time is spent inside a run. To measure externally visible performance, record request rate or concurrency, prompt and output lengths, latency, token throughput, and errors from a repeatable client workload. Keep model, device placement, sampling settings, and runtime capacity fixed when comparing runs; report first-run startup separately from steady-state generation.
+
 ## Profile Setup
 
 HTTP serving and offline generation profiling are configured with the `pypto-serving` profiling options documented in [CLI Reference](../cli-reference/pypto-serving.md#profiling-arguments).
@@ -71,9 +73,9 @@ pypto-serving \
 Wait for the server to become ready, start profiling, send the workload, and then stop profiling:
 
 ```bash
-curl --noproxy "*" -X POST http://localhost:8899/start_profile
+curl -X POST http://localhost:8899/start_profile
 # Send the requests to profile.
-curl --noproxy "*" -X POST http://localhost:8899/stop_profile
+curl -X POST http://localhost:8899/stop_profile
 ```
 
 The endpoints follow the vLLM profiling API. `start_profile` starts recording in the API process and every replica worker. `stop_profile` waits for every worker to flush its fragment and then atomically writes the merged trace to `/tmp/pypto-profile-serving/trace.json`; the serving process keeps running. Repeated `start_profile` calls while active and `stop_profile` calls while inactive are safe.

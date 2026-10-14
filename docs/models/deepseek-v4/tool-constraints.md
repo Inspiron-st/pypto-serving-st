@@ -1,12 +1,13 @@
 # DeepSeek V4 DSpark constrained tool deployment
 
-This guide deploys structural tool-call constraints for DeepSeek V4 Flash DSpark with fused K7 decoding. The tool names and JSON schemas come from each `/v1/chat/completions` request, not from a server-side allowlist or a particular agent client. Serving compiles the request grammar on the host; the device receives a fixed-layout allowed-token mask and still runs one fused K7 decode dispatch per step.
+This guide deploys structural tool-call constraints for DeepSeek V4 Flash DSpark with K7 decoding. The tool names and JSON schemas come from each `/v1/chat/completions` request, not from a server-side allowlist or a particular agent client.
+
+For the common request, tool-result, and streaming behavior, see [Tool Calling](../../user-guide/tool-calling.md). The model's DSML limits are in [Function Tool Format](index.md#function-tool-format).
 
 ## Compatible components
 
-- Use a DeepSeek V4 Flash DSpark W8A8 checkpoint and the 16-device `--dp 4 --ep 16 --tp 4` topology described in [DSpark serving](../developer-guide/deepseek-v4-dspark.md).
-- Deploy PyPTO Serving and PyPTO-Lib as a matched pair. Their prefill and decode positional ABI now includes `grammar_mask`; fused K7 decode also includes `valid_draft_counts`. Updating only one repository will not work. The mask shape and argument order are fixed regardless of whether a request has constraints.
-- The mask also carries a row-mode header in segment 0's last padding word: `-1` selects ordinary argmax and `0` enables masking. Serving packs this header; it is not part of the provider's vocabulary bitset. Deploy the matching packer and sampler together even when their tensor shapes have not changed.
+- Use a DeepSeek V4 Flash DSpark W8A8 checkpoint and the 16-device `--dp 4 --ep 16 --tp 4` topology described in [DSpark deployment](dspark.md).
+- Deploy PyPTO Serving and PyPTO-Lib as a matched pair. Their kernel argument layouts must agree; updating only one repository will not work.
 - Install `xgrammar==0.2.7` into the Python environment that runs Serving. This is the version validated with the DeepSeek V4 structural-tag grammar and the checkpoint tokenizer. XGrammar is a host-side dependency; PyPTO-Lib does not import it. See the [XGrammar package](https://pypi.org/project/xgrammar/0.2.7/).
 - DSpark currently supports greedy sampling only. Use `temperature: 0`; non-greedy requests are rejected rather than silently changing sampling behavior.
 
@@ -15,7 +16,7 @@ python -m pip install 'xgrammar==0.2.7'
 python -m pip show xgrammar
 ```
 
-Serving uses PyPTO's validated persistent JIT cache; there is no cache CLI flag. `PYPTO_CACHE=1` enables reuse and `PYPTO_CACHE_DIR` selects the artifact root. Leave `PYPTO_PROG_BUILD_DIR` unset for reuse, because requesting explicit build output bypasses caching. PyPTO checks source, specialization and toolchain identity before reusing an executable. See [Startup and Build Cache](../cli-reference/pypto-serving.md#startup-and-build-cache) for the required PyPTO revision and cache controls.
+Serving uses PyPTO's validated persistent JIT cache; there is no cache CLI flag. `PYPTO_CACHE=1` enables reuse and `PYPTO_CACHE_DIR` selects the artifact root. Leave `PYPTO_PROG_BUILD_DIR` unset for reuse, because requesting explicit build output bypasses caching. See [JIT Cache](../../developer-guide/jit-cache.md) for the required PyPTO revision and cache controls.
 
 ## Start the service
 
@@ -72,13 +73,9 @@ curl --noproxy '*' http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Expect a completed `message.tool_calls` entry named `shell`, with `function.arguments` as a JSON string containing `command`, and `finish_reason: "tool_calls"`. A length-truncated call is not a successful invocation. For a baseline, repeat the request with `tool_choice: "auto"` and `strict` omitted: it follows the unconstrained path and may answer directly or produce a tool call. `/v1/completions` uses the same fixed kernel ABI with an all-allowed mask.
+Expect a completed `message.tool_calls` entry named `shell`, with `function.arguments` as a JSON string containing `command`, and `finish_reason: "tool_calls"`. A length-truncated call is not a successful invocation. For a baseline, repeat the request with `tool_choice: "auto"` and `strict` omitted: it follows the unconstrained path and may answer directly or produce a tool call.
 
 `auto` enters structural constraints only when at least one declared tool has `strict: true`; `required` and a named tool choice also enter the constrained path. A schema needs `required` to require a field and `additionalProperties: false` to exclude unknown fields. Ordinary non-strict `auto` does not guarantee schema-valid parameters. `parallel_tool_calls` is passed to the grammar only for constrained requests.
-
-Ordinary batches reuse immutable device-resident all-allowed masks and default draft counts. The sampler skips bitset decoding for ordinary rows; constrained rows apply the mask before the same running-maximum reduction. These paths share the fused K7 interface and do not require a separate forward/sampling dispatch.
-
-Constrained requests reuse request-local Host bitmask storage. Draft validation and mask generation share one speculative traversal, then roll back; only committed output advances the grammar. Serving packs the valid prefix and bonus row directly into shared buffers without unpacking vocabulary bits. With asynchronous scheduling enabled, acceptance-independent metadata can prepare early, but mask planning still waits for that request's previous output to be committed. Mutable slot ownership lasts through output reclaim. Constrained masks still use the existing full-tensor runtime upload path; Host row reuse is not partial H2D transfer.
 
 Missing XGrammar, an unsupported schema, or an unsupported model path yields an HTTP 400 before streaming headers are sent. There is no fallback to unconstrained generation for a request that asked for constraints. Request completion and cancellation release request-local grammar state. Recompute preemption of a constrained request is not yet supported. Under cache pressure, it waits while in-flight work can make progress; if no progress is possible, the scheduler explicitly rejects a stalled request and releases its resources.
 

@@ -26,13 +26,17 @@ CLI
 
 ## Runtime Shape
 
-The API process receives HTTP requests and forwards generation work to the async engine. The scheduler allocates KV pages, selects requests, and dispatches prefill or decode work. Worker processes own model executors and device-facing execution state.
+The API process receives HTTP requests and forwards generation work to `AsyncLLMEngine` in `serving/engine/async_engine.py`. Each `ReplicaEngineCore` owns a `Scheduler`, a `KvCacheManager`, and a worker process. Replica placement creates one core per replica; overlapped placement creates one core for the model-local rank group.
+
+`ReplicaEngineCore._try_dispatch_step()` asks the scheduler for work, `_build_step_command()` sends a `StepCommand` to the worker, and `_process_step_output()` applies its `StepResult`. The worker's `_make_prefill_batch()` and `_make_decode_batch()` preserve request IDs, token positions, cache partitions, and per-group block IDs when constructing model-facing batches. The executor delegates those batches to its runner, which binds the PyPTO kernel arguments.
+
+Worker startup is also part of the capacity contract: `WorkerProcess.init_device_and_model()` loads the checkpoint through `ModelLoader`, selects the configured executor, and calls `register_model()`. The runner uploads persistent weights and allocates device KV pools before reporting their actual capacity to the engine. Only then does the scheduler use the available page count.
 
 The C++ `platform/` subtree is a separate platform-management layer and is not in the per-token Python serving hot path.
 
 ## Scheduler and KV Cache
 
-The scheduler tracks request state, enforces runtime limits, allocates KV cache pages, and dispatches work to the engine.
+The scheduler in `serving/sched/scheduler.py` tracks request state, enforces token and request limits, and allocates cache pages through `KvCacheManager` in `serving/memory/kv_cache.py`.
 
 Request flow:
 
@@ -43,11 +47,11 @@ Request flow:
 5. The model executor runs prefill and then decode steps.
 6. The scheduler releases cache pages when the request finishes.
 
-The generic KV cache uses page IDs and a fixed block size. DeepSeek V4 uses grouped cache specs for model-specific cache families and rank-local partitions.
+The generic cache uses page IDs and a fixed block size. For model-specific layouts, `RuntimeConfig.kv_cache_groups` carries `KVCacheGroupSpec` entries with independent page size, compression ratio, rolling-history limit, and partition count. The scheduler owns logical block IDs; the runner owns the device tensors and converts those IDs into kernel block tables and slot mappings. See [MTP Internals](../models/deepseek-v4/mtp-internals.md#cache-layout) and [DSpark Internals](../models/deepseek-v4/dspark-internals.md#how-the-deployment-maps-onto-the-kernels) for the two DeepSeek layouts.
 
 ## Worker and Executor
 
-Serving workers isolate model execution from the API process. A worker owns the model executor, compiled kernel handles, and device-facing runtime state.
+Serving workers isolate model execution from the API process. `WorkerProcess` owns a model executor; `PyptoExecutor` in `model/common/executor/pypto_executor.py` compiles model callables and registers a `ModelRunner` for the loaded model. The runner owns compiled kernel bindings, resident weights, scratch buffers, and device cache tensors.
 
 Worker responsibilities:
 
@@ -57,6 +61,6 @@ Worker responsibilities:
 - Participate in profiling start and stop commands.
 - Return generated token state to the engine.
 
-Model executors implement the model-specific bridge from serving batches to PyPTO kernels. Qwen and DeepSeek V4 have separate executors and runners because their kernel layouts, cache layouts, and parallel contracts differ.
+`ModelExecutor` defines the worker-facing capabilities and prefill/decode methods. `ModelRunner` defines `init_kv_cache()`, `run_prefill()`, and `run_decode()`; model implementations may also support split prepare/dispatch/reclaim methods for asynchronous execution. Qwen, DeepSeek V4 MTP, and DSpark have separate executors and runners because their kernel ABIs, cache layouts, and parallel contracts differ. The [Model Integration](model-integration.md) guide maps these interfaces to the steps for adding a model.
 
 Changes to request scheduling or cache allocation should include focused unit tests under `tests/unit/serving/` and NPU validation when model behavior or device dispatch is affected.
