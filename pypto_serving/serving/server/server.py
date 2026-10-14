@@ -41,7 +41,7 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel, Field, model_serializer
+    from pydantic import BaseModel, Field, model_serializer, model_validator
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
@@ -129,6 +129,9 @@ class ChatCompletionRequest(BaseModel):
     model: str = ""
     messages: list[ChatMessage]
     max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    min_tokens: int | None = Field(default=None, ge=0)
+    ignore_eos: bool | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -141,6 +144,14 @@ class ChatCompletionRequest(BaseModel):
     tools: list[ChatTool] | None = None
     tool_choice: str | dict | None = None
     parallel_tool_calls: bool = True
+
+    @model_validator(mode="after")
+    def _validate_selected_token_limit(self) -> ChatCompletionRequest:
+        field = "max_completion_tokens" if self.max_completion_tokens is not None else "max_tokens"
+        limit = self.max_completion_tokens if self.max_completion_tokens is not None else self.max_tokens
+        if limit is not None and limit <= 0:
+            raise ValueError(f"{field} must be a positive integer")
+        return self
 
 
 class CompletionChoice(BaseModel):
@@ -280,10 +291,11 @@ class ServingServer:
     def _resolve_generate_config(self, request: CompletionRequest | ChatCompletionRequest) -> GenerateConfig:
         """Build the per-request config from the server-wide defaults.
 
-        A field the request explicitly sets always wins — including "empty"
-        values that clear a server default (``stop: []`` clears the server
-        stop strings, ``top_k: null`` disables the server top-k). Fields the
-        request omits fall back to ``self.generate_config``.
+        A field the request explicitly sets wins, including "empty" values
+        that clear a server default (``stop: []`` clears the server stop
+        strings, ``top_k: null`` disables the server top-k). Token limits
+        instead use the first non-null value. Omitted fields fall back to
+        ``self.generate_config``.
         """
         defaults = self.generate_config
         provided = request.model_fields_set
@@ -293,10 +305,23 @@ class ServingServer:
         else:
             stop = defaults.stop
 
+        if isinstance(request, ChatCompletionRequest) and request.max_completion_tokens is not None:
+            max_new_tokens = request.max_completion_tokens
+        elif isinstance(request, ChatCompletionRequest) and request.max_tokens is not None:
+            max_new_tokens = request.max_tokens
+        elif isinstance(request, CompletionRequest) and request.max_tokens is not None:
+            max_new_tokens = request.max_tokens
+        else:
+            max_new_tokens = defaults.max_new_tokens
+
+        min_tokens = (
+            request.min_tokens
+            if isinstance(request, ChatCompletionRequest) and request.min_tokens is not None
+            else defaults.min_tokens
+        )
         return GenerateConfig(
-            max_new_tokens=request.max_tokens
-            if "max_tokens" in provided
-            else defaults.max_new_tokens,
+            max_new_tokens=max_new_tokens,
+            min_tokens=min_tokens,
             temperature=request.temperature
             if "temperature" in provided
             else defaults.temperature,
@@ -305,6 +330,11 @@ class ServingServer:
             seed=request.seed if "seed" in provided else defaults.seed,
             stop=stop,
             stream=request.stream if "stream" in provided else defaults.stream,
+            ignore_eos=(
+                request.ignore_eos
+                if isinstance(request, ChatCompletionRequest) and request.ignore_eos is not None
+                else defaults.ignore_eos
+            ),
         )
 
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
@@ -357,14 +387,7 @@ class ServingServer:
             reasoning_effort=request.reasoning_effort,
             tools=request.tools,
         )
-        # The OpenAI chat schema has no ignore_eos field, so the server-wide
-        # config decides it (the completions endpoint keeps its historic
-        # always-ignore-EOS override).
-        config = dataclasses.replace(
-            self._resolve_generate_config(request),
-            ignore_eos=self.generate_config.ignore_eos,
-        )
-
+        config = self._resolve_generate_config(request)
         with profile_span(
             "http.chat_completions",
             cat="request",

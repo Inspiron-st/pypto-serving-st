@@ -25,6 +25,7 @@ class GenerateConfig:
     """User-facing options that control text generation."""
 
     max_new_tokens: int = 256
+    min_tokens: int = 0
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None
@@ -32,6 +33,22 @@ class GenerateConfig:
     stop: tuple[str, ...] = ()
     stream: bool = False
     ignore_eos: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.max_new_tokens, int)
+            or isinstance(self.max_new_tokens, bool)
+            or self.max_new_tokens <= 0
+        ):
+            raise ValueError("max_new_tokens must be a positive integer")
+        if (
+            not isinstance(self.min_tokens, int)
+            or isinstance(self.min_tokens, bool)
+            or self.min_tokens < 0
+        ):
+            raise ValueError("min_tokens must be a non-negative integer")
+        if self.min_tokens > self.max_new_tokens:
+            raise ValueError(f"min_tokens {self.min_tokens} exceeds max_tokens {self.max_new_tokens}")
 
 
 @dataclass(frozen=True)
@@ -246,6 +263,7 @@ class SamplingParams:
     top_p: float
     top_k: int | None = None
     seed: int | None = None
+    forbidden_token_ids: tuple[int, ...] = ()
 
 
 @dataclass
@@ -287,6 +305,14 @@ class KvAllocation:
     tokens_used: int = 0
 
 
+@dataclass(frozen=True)
+class StopTokenMask:
+    """Immutable dispatch-time stop constraint for device sampling."""
+
+    stop_token_ids: tuple[int, ...]
+    remaining_tokens: int
+
+
 @dataclass
 class PrefillBatch:
     """Packed inputs for a batched prompt prefill call."""
@@ -309,6 +335,7 @@ class PrefillBatch:
     cache_partitions: list[int | None] = field(default_factory=list)
     # Opaque request-local generation constraints, interpreted only by capable runners.
     constraint_states: dict[str, object] = field(default_factory=dict)
+    stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
 
 
 @dataclass
@@ -341,6 +368,7 @@ class DecodeBatch:
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
     constraint_states: dict[str, object] = field(default_factory=dict)
+    stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
     # Optional MTP context for models (e.g. DeepSeek V4) that decode two real
     # trailing tokens per step. ``prev_token_ids`` holds the token id at absolute
     # position ``seq_len-2`` per request (shape ``[B]``) and ``prev_hidden_states``

@@ -40,10 +40,10 @@ PLACEHOLDER_TOKEN: int = -1
 # ---------------------------------------------------------------------------
 
 class NewRequestData(msgspec.Struct):
-    """Full request data sent exactly once when a request is first scheduled.
+    """Full request data sent when a request is scheduled or restarted.
 
     The worker caches this and references it by ``request_id`` for the lifetime
-    of the request.  ``prompt_token_ids`` are never re-sent after this message.
+    of the registration. ``prompt_token_ids`` are not re-sent until a restart.
     """
 
     request_id: str
@@ -52,6 +52,9 @@ class NewRequestData(msgspec.Struct):
     top_p: float
     top_k: int | None
     seed: int | None = None
+    min_tokens: int = 0
+    eos_token_id: int | None = None
+    initial_output_tokens: int = 0
     constraint_spec: dict[str, Any] | None = None
 
 

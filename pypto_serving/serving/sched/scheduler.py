@@ -116,12 +116,14 @@ class Request:
     request_id: str
     prompt_token_ids: list[int]
     max_new_tokens: int
+    min_tokens: int = 0
     arrival_time: float = field(default_factory=time.time)
     status: RequestStatus = RequestStatus.WAITING
     num_computed_tokens: int = 0
     output_token_ids: list[int] = field(default_factory=list)
     stop_strings: tuple[str, ...] = ()
     eos_token_id: int | None = None
+    ignore_eos: bool = False
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None
@@ -208,6 +210,7 @@ class RequestOutput:
     new_token_id: int | None = None
     finished: bool = False
     finish_reason: str = ""
+    num_output_tokens: int | None = None
 
 
 class Scheduler:
@@ -256,6 +259,11 @@ class Scheduler:
                 max_seq_len, prompt_len,
             )
             request.max_new_tokens = remaining
+        if request.min_tokens > request.max_new_tokens:
+            raise ValueError(
+                f"Request {request.request_id} min_tokens {request.min_tokens} exceeds "
+                f"available generation tokens {request.max_new_tokens}"
+            )
         if not self.config.enable_prefix_cache:
             rejection = self._single_prefill_rejection(request)
             if rejection is not None:
@@ -284,11 +292,14 @@ class Scheduler:
         del self.requests[request_id]
 
     def finish_request(self, request_id: str, status: RequestStatus) -> None:
-        """Mark a running request as finished and free its resources."""
+        """Mark a request finished, releasing resources only on the first finish."""
         request = self.requests.get(request_id)
         if request is None:
             return
+        was_finished = request.status.is_finished
         request.status = status
+        if was_finished:
+            return
         self._free_request_blocks(request)
         self.running = [r for r in self.running if r.request_id != request_id]
 
@@ -814,7 +825,10 @@ class Scheduler:
                     continue
                 for token_id in token_ids:
                     request.output_token_ids.append(token_id)
-                    outputs.append(RequestOutput(request_id=request.request_id, new_token_id=token_id))
+                    outputs.append(RequestOutput(
+                        request_id=request.request_id, new_token_id=token_id,
+                        num_output_tokens=len(request.output_token_ids),
+                    ))
                     if self._check_finish(request) is not None:
                         break
             else:
@@ -822,7 +836,10 @@ class Scheduler:
                 for token_id in token_ids:
                     request.output_token_ids.append(token_id)
                     retained_tokens += 1
-                    outputs.append(RequestOutput(request_id=request.request_id, new_token_id=token_id))
+                    outputs.append(RequestOutput(
+                        request_id=request.request_id, new_token_id=token_id,
+                        num_output_tokens=len(request.output_token_ids),
+                    ))
                     if self._check_finish(request) is not None:
                         break
                 request.num_computed_tokens += retained_tokens
@@ -924,7 +941,10 @@ class Scheduler:
         for token_id in token_ids:
             request.output_token_ids.append(token_id)
             retained_tokens += 1
-            outputs.append(RequestOutput(request_id=request.request_id, new_token_id=token_id))
+            outputs.append(RequestOutput(
+                request_id=request.request_id, new_token_id=token_id,
+                num_output_tokens=len(request.output_token_ids),
+            ))
             if self._check_finish(request) is not None:
                 # Tokens after a finish are dropped (mirrors the sync path), so
                 # they must not count as retained.
@@ -959,7 +979,7 @@ class Scheduler:
         if not request.output_token_ids:
             return None
         last_token = request.output_token_ids[-1]
-        if request.eos_token_id is not None and last_token == request.eos_token_id:
+        if not request.ignore_eos and request.eos_token_id is not None and last_token == request.eos_token_id:
             return RequestStatus.FINISHED_EOS
         if len(request.output_token_ids) >= request.max_new_tokens:
             return RequestStatus.FINISHED_LENGTH

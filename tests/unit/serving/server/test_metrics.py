@@ -54,13 +54,15 @@ def test_worker_preserves_speculation_metadata_in_serial_and_reclaim_results(rec
     )
     worker.model_record = SimpleNamespace(runtime_model=object())
     worker._make_decode_batch = lambda *args, **kwargs: object()
-    worker._allow_device_sampled_ids = lambda scheduled: True
-    worker._allow_device_topk_sampling = lambda scheduled: False
+    worker._allow_device_sampled_ids = lambda scheduled, *, phase: True
+    worker._allow_device_topk_sampling = lambda scheduled, *, phase: False
     worker._last_tokens = {}
     scheduled = [DecodeRequest("spec", 10, 20, []), DecodeRequest("fallback", 20, 30, [])]
     command = StepCommand([], [], scheduled, [], step_id=42)
     if reclaim:
-        step = worker._reclaim_pending_decode(SimpleNamespace(cmd=command, pending=object(), scheduled=scheduled))
+        step = worker._reclaim_pending_decode(SimpleNamespace(
+            cmd=command, pending=object(), scheduled=scheduled, batch=None,
+        ))
     else:
         step = worker._execute_step(command)
     wire = decode_result(encode_result(step))

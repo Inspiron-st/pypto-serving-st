@@ -57,6 +57,7 @@ from pypto_serving.config.types import (
     RuntimeConfig,
     RuntimeModel,
     SamplingParams,
+    StopTokenMask,
 )
 from pypto_serving.model.common.runner.buffer_set import (
     StaticDeviceTensor,
@@ -70,6 +71,7 @@ from pypto_serving.model.deepseek_dspark.weight_loader import (
     DSparkStackedLayerWeights,
     DSparkWeightStore,
 )
+from pypto_serving.serving.sampling.stop_rules import blocked_token_ids
 from pypto_serving.tools.profile import profile_span
 
 logger = logging.getLogger(__name__)
@@ -1213,6 +1215,7 @@ class _DSparkPendingDecode:
     dispatch: PendingL3Dispatch
     inputs: DSparkPreparedDecodeInputs
     sampled_ids: torch.Tensor
+    draft_count_limits: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -2811,7 +2814,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             prepared.chunk_starts, prepared.chunk_lens, prepared.prompt_lens, strict=True
         )):
             raise ValueError("Terminal prefill must complete bootstrap before delivery")
-        if batch.constraint_states:
+        if self._has_token_masks(batch):
             raise ValueError("Async DSpark prefill cannot stage constraints before the terminal chunk")
         self._wait_for_pending_prefill_dispatches()
         self._wait_for_pending_decode_dispatches()
@@ -2875,6 +2878,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             sampled_token_ids=torch.tensor(tokens, dtype=torch.long),
         )
 
+    @staticmethod
+    def _prefill_needs_sampled_output(batch: PrefillBatch) -> bool:
+        if not batch.prompt_lens:
+            return True
+        return any(
+            seq_len >= prompt_len
+            for seq_len, prompt_len in zip(batch.seq_lens, batch.prompt_lens, strict=True)
+        )
+
     def _execute_prefill_step(
         self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int = 0,
     ) -> PrefillResult:
@@ -2884,7 +2896,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if self._compiled.prefill_async:
             self._wait_for_pending_prefill_dispatches()
         self._wait_for_pending_decode_dispatches()
-        if not batch.allow_device_greedy_sampling:
+        if self._prefill_needs_sampled_output(batch) and not batch.allow_device_greedy_sampling:
             raise RuntimeError(
                 "DSpark serving currently supports greedy generation only "
                 "(the kernels expose device greedy sampling; no temperature ABI yet)"
@@ -2905,7 +2917,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             with profile_span(
                 "DSparkModelRunner.prefill.stage_constraints",
                 cat="constraints",
-                args={"constrained_requests": len(batch.constraint_states)},
+                args={"constrained_requests": len(batch.constraint_states) + len(batch.stop_token_masks)},
             ):
                 self._stage_prefill_grammar(batch, inputs, buffer_slot=buffer_slot)
             task_args.clear_outputs()
@@ -2914,7 +2926,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 **({"task_args": task_args} if self._compiled.prefill_async else {}),
             )
             args = self._grammar_dispatch_args(
-                args, task_args.names, constrained=bool(batch.constraint_states)
+                args, task_args.names, constrained=self._has_token_masks(batch)
             )
             self._trace_prefill_chunk(inputs, status="started")
             try:
@@ -3597,10 +3609,30 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 resolved[names.index(name)] = marker
         return tuple(resolved)
 
+    @staticmethod
+    def _has_token_masks(batch: PrefillBatch | DecodeBatch) -> bool:
+        return bool(batch.constraint_states or getattr(batch, "stop_token_masks", {}))
+
+    @staticmethod
+    def _apply_stop_token_mask(
+        rows: np.ndarray, mask: StopTokenMask, *, preserve_nonempty: bool = False
+    ) -> None:
+        bits = rows.view(np.uint32)
+        for offset in range(len(rows)):
+            allowed_stop_bits = []
+            for token_id in blocked_token_ids(mask.stop_token_ids, mask.remaining_tokens, offset):
+                word, bit = divmod(token_id, 32)
+                if preserve_nonempty and bits[offset, word] & np.uint32(1 << bit):
+                    allowed_stop_bits.append((word, bit))
+                bits[offset, word] &= np.uint32(0xFFFFFFFF ^ (1 << bit))
+            if allowed_stop_bits and not np.any(bits[offset]):
+                for word, bit in allowed_stop_bits:
+                    bits[offset, word] |= np.uint32(1 << bit)
+
     def _stage_prefill_grammar(
         self, batch: PrefillBatch, inputs: DSparkPreparedPrefillInputs, *, buffer_slot: int = 0,
     ) -> None:
-        if not batch.constraint_states:
+        if not self._has_token_masks(batch):
             return
         task_args = self._prefill_task_arg_slots[buffer_slot]
         if task_args is None:
@@ -3612,12 +3644,20 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         try:
             for request_id, (rank, row) in zip(inputs.request_ids, inputs.sampled_slots, strict=True):
                 state = batch.constraint_states.get(request_id)
-                if state is None:
+                mask = getattr(batch, "stop_token_masks", {}).get(request_id)
+                if state is None and mask is None:
                     continue
                 active.add((rank, row))
-                valid, rows = state.plan_draft_rows(())
+                if state is None:
+                    valid = 0
+                    rows = np.full((1, DSPARK_VOCAB_SIZE // 32), -1, dtype=np.int32)
+                else:
+                    valid, rows = state.plan_draft_rows(())
                 if valid != 0 or rows.shape != (1, DSPARK_VOCAB_SIZE // 32):
                     raise ValueError("constraint provider returned invalid prefill row masks")
+                if mask is not None:
+                    rows = rows.copy()
+                    self._apply_stop_token_mask(rows, mask, preserve_nonempty=state is not None)
                 self._copy_grammar_mask_row(masks[rank, row], rows[0])
         except Exception:
             for rank, row in previous | active:
@@ -3629,9 +3669,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
 
     def _stage_decode_grammar(
         self, batch: DecodeBatch, inputs: DSparkPreparedDecodeInputs
-    ) -> None:
-        if not batch.constraint_states:
-            return
+    ) -> tuple[int, ...] | None:
+        if not self._has_token_masks(batch):
+            return None
         slot = inputs.buffer_slot
         task_args = self._decode_task_args[slot]
         masks = task_args.tensors["grammar_mask"]
@@ -3640,24 +3680,46 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._decode_grammar_rows[slot] = set()
         counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
         active: set[tuple[int, int]] = set()
+        limits = [DSPARK_DRAFTER_QUERY_WIDTH] * len(inputs.request_ids)
         layout = self._compiled.layout
         try:
-            for request_id, group, ordinal, (rank, row) in zip(
+            for index, (request_id, group, ordinal, (rank, row)) in enumerate(zip(
                 inputs.request_ids, inputs.groups, inputs.group_ordinals,
                 inputs.sampled_slots, strict=True,
-            ):
+            )):
                 constraint = batch.constraint_states.get(request_id)
-                if constraint is None:
+                mask = getattr(batch, "stop_token_masks", {}).get(request_id)
+                if mask is not None and mask.remaining_tokens <= 0:
+                    mask = None
+                if constraint is None and mask is None:
                     continue
-                drafts = self._drafter_state(request_id).pending_draft_tokens
-                valid, rows = constraint.plan_draft_rows(drafts)
-                if not 0 <= valid <= min(len(drafts), DSPARK_DRAFTER_QUERY_WIDTH):
-                    raise ValueError("constraint provider returned an invalid draft prefix length")
-                if rows.shape != (valid + 1, DSPARK_VOCAB_SIZE // 32):
+                if constraint is None:
+                    valid = min(
+                        getattr(self._compiled, "num_speculative_tokens", DSPARK_DRAFTER_QUERY_WIDTH),
+                        DSPARK_DRAFTER_QUERY_WIDTH,
+                    )
+                    # Unprotected rows already use the immutable all-allowed mask.
+                    row_count = min(valid + 1, mask.remaining_tokens)
+                    rows = np.full((row_count, DSPARK_VOCAB_SIZE // 32), -1, dtype=np.int32)
+                else:
+                    drafts = (
+                        self._drafter_state(request_id).pending_draft_tokens
+                        if getattr(self._compiled, "num_speculative_tokens", DSPARK_DRAFTER_QUERY_WIDTH) > 0
+                        else []
+                    )
+                    valid, rows = constraint.plan_draft_rows(drafts)
+                    if not 0 <= valid <= min(len(drafts), DSPARK_DRAFTER_QUERY_WIDTH):
+                        raise ValueError("constraint provider returned an invalid draft prefix length")
+                    row_count = valid + 1
+                if rows.shape != (row_count, DSPARK_VOCAB_SIZE // 32):
                     raise ValueError(f"constraint provider returned invalid row masks {rows.shape}")
+                if mask is not None:
+                    rows = rows.copy()
+                    self._apply_stop_token_mask(rows, mask, preserve_nonempty=constraint is not None)
                 counts[group * layout.tp_size : (group + 1) * layout.tp_size, ordinal] = valid
-                active.update((rank, row + offset) for offset in range(valid + 1))
-                self._copy_grammar_mask_rows(masks[rank, row:row + valid + 1], rows)
+                limits[index] = valid
+                active.update((rank, row + offset) for offset in range(row_count))
+                self._copy_grammar_mask_rows(masks[rank, row:row + row_count], rows)
         except Exception:
             for rank, row in previous | active:
                 masks[rank, row].fill_(-1)
@@ -3667,6 +3729,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         for rank, row in previous - active:
             masks[rank, row].fill_(-1)
         self._decode_grammar_rows[slot] = active
+        return tuple(limits)
 
     # ------------------------------------------------------------------
     # decode
@@ -3780,10 +3843,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         with profile_span(
             "DSparkModelRunner.decode.stage_constraints",
             cat="constraints",
-            args={"constrained_requests": len(batch.constraint_states)},
+            args={"constrained_requests": len(batch.constraint_states) + len(batch.stop_token_masks)},
         ):
-            self._stage_decode_grammar(batch, inputs)
-        return self._launch_fused_decode(batch, inputs)
+            draft_count_limits = self._stage_decode_grammar(batch, inputs)
+        return self._launch_fused_decode(batch, inputs, draft_count_limits)
 
     def reclaim_prepared_decode(self, pending: object) -> DecodeResult:
         """Wait for one-L2 completion and materialize only compact Host outputs."""
@@ -3801,14 +3864,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             with profile_span(
                 "DSparkModelRunner.decode.stage_constraints",
                 cat="constraints",
-                args={"constrained_requests": len(batch.constraint_states)},
+                args={"constrained_requests": len(batch.constraint_states) + len(batch.stop_token_masks)},
             ):
-                self._stage_decode_grammar(batch, inputs)
-            return self._reclaim_fused_decode(self._launch_fused_decode(batch, inputs))
-        if batch.constraint_states:
-            raise RuntimeError("DSpark grammar constraints require the fused K7 decode path")
+                draft_count_limits = self._stage_decode_grammar(batch, inputs)
+            return self._reclaim_fused_decode(
+                self._launch_fused_decode(batch, inputs, draft_count_limits)
+            )
         with profile_span("DSparkModelRunner.decode.execute", cat="executor"):
             task_args = self._decode_task_args[inputs.buffer_slot]
+            draft_count_limits = self._stage_decode_grammar(batch, inputs)
             fused_device_state = self._compiled.decode_device_state_fused
             if (
                 self.speculative
@@ -3817,7 +3881,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             ):
                 self._prepare_target_inputs_on_device(inputs.buffer_slot, task_args)
             args = task_args.build()
-            args = self._grammar_dispatch_args(args, task_args.names, constrained=False)
+            args = self._grammar_dispatch_args(
+                args, task_args.names, constrained=self._has_token_masks(batch)
+            )
             if fused_device_state:
                 args = (*args, *self._fused_decode_device_state_args(inputs.buffer_slot))
             try:
@@ -3835,7 +3901,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     f"(actual_batch={len(batch.request_ids)})"
                 ) from exc
             sampled = task_args.tensors["sampled_ids"]
-            num_draft_tokens = self._verified_draft_counts(inputs)
+            num_draft_tokens = self._verified_draft_counts(inputs, draft_count_limits)
             if fused_device_state:
                 accepted, rows_by_rank = self._accept_decode_outputs_on_device(
                     inputs, sampled, dispatch=False
@@ -3855,15 +3921,21 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 num_draft_tokens=num_draft_tokens,
             )
 
-    def _verified_draft_counts(self, inputs: DSparkPreparedDecodeInputs) -> list[int] | None:
+    def _verified_draft_counts(
+        self, inputs: DSparkPreparedDecodeInputs, draft_count_limits: tuple[int, ...] | None = None
+    ) -> list[int] | None:
         """Count consumed drafts before acceptance or redrafting mutates Host state."""
         if not self.speculative:
             return None
         max_position = self._require_rope_tables().max_position
         counts: list[int] = []
-        for request_id, speculative in zip(inputs.request_ids, inputs.speculative_flags, strict=True):
+        limits = draft_count_limits or (DSPARK_DRAFTER_QUERY_WIDTH,) * len(inputs.request_ids)
+        for request_id, speculative, limit in zip(
+            inputs.request_ids, inputs.speculative_flags, limits, strict=True
+        ):
             state = self._drafter_state(request_id)
             count = state.device_draft_count if state.device_draft_count is not None else len(state.pending_draft_tokens)
+            count = min(count, limit)
             # Fused prepare runs ahead of acceptance and marks every row as
             # speculative. FIFO reclaim provides the previous step's Host
             # mirror; committed_count is the current device anchor. Apply the
@@ -3899,6 +3971,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self,
         batch: DecodeBatch,
         inputs: DSparkPreparedDecodeInputs,
+        draft_count_limits: tuple[int, ...] | None = None,
     ) -> _DSparkPendingDecode:
         """Submit one command-lane-complete one-L2 decode snapshot."""
         args = inputs.dispatch_args
@@ -3910,7 +3983,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             name for name in self._decode_task_args[inputs.buffer_slot].names
             if name not in _DSPARK_FUSED_INTERNAL_PREPARE_NAMES
         )
-        args = self._grammar_dispatch_args(args, names, constrained=bool(batch.constraint_states))
+        args = self._grammar_dispatch_args(args, names, constrained=self._has_token_masks(batch))
         try:
             with profile_span(
                 "DSparkModelRunner.decode.l3_dispatch",
@@ -3932,6 +4005,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             dispatch=dispatch,
             inputs=inputs,
             sampled_ids=self._decode_task_args[inputs.buffer_slot].tensors["sampled_ids"],
+            draft_count_limits=draft_count_limits,
         )
 
     def _reclaim_fused_decode(self, pending: _DSparkPendingDecode) -> DecodeResult:
@@ -3944,7 +4018,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 pending.dispatch,
             )
         with profile_span("DSparkModelRunner.decode.reclaim", cat="executor"):
-            num_draft_tokens = self._verified_draft_counts(pending.inputs)
+            num_draft_tokens = self._verified_draft_counts(
+                pending.inputs, pending.draft_count_limits
+            )
             accepted, rows_by_rank = self._accept_decode_outputs_on_device(
                 pending.inputs,
                 pending.sampled_ids,
