@@ -16,6 +16,7 @@ tests need neither httpx nor a live replica.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from types import SimpleNamespace
 
@@ -461,3 +462,84 @@ def test_registered_routes_match_the_serving_api():
     router = _router()
     paths = {route.path for route in router.app.routes}
     assert {"/health", "/v1/models", "/v1/completions", "/v1/chat/completions"} <= paths
+
+
+# --- the counter survives cancellation -------------------------------------
+#
+# `outstanding` drives both routing and the drain loop, so a request that dies
+# without releasing it inflates a replica's load forever and stalls any drain
+# waiting for it to reach zero. CancelledError is a BaseException, so neither
+# site that cleans up can rely on `except Exception`.
+
+
+class _HangingClient(_FakeClient):
+    """Blocks in send() until cancelled, like an upstream that never answers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+
+    async def send(self, request, stream: bool = False):
+        self.entered.set()
+        await asyncio.Event().wait()  # never resolves; only cancellation ends it
+
+
+def test_cancelling_while_waiting_for_headers_releases_the_count():
+    async def scenario():
+        client = _HangingClient()
+        router = _router(count=1, client=client)
+        task = asyncio.create_task(
+            router.proxy.forward(_FakeRequest(b"{}"), "/v1/completions")
+        )
+        await client.entered.wait()
+        assert router.registry.state("r0").outstanding == 1, "precondition"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return router.registry.state("r0").outstanding
+
+    assert asyncio.run(scenario()) == 0
+
+
+class _UncloseableUpstream(_FakeUpstream):
+    """Its aclose() is cancelled, which used to skip the release entirely."""
+
+    async def aclose(self) -> None:
+        raise asyncio.CancelledError
+
+
+def test_cancelling_during_upstream_close_still_releases_the_count():
+    async def scenario():
+        client = _FakeClient(chunks=(b"a",))
+        router = _router(count=1, client=client)
+
+        async def send(request, stream: bool = False):
+            upstream = _UncloseableUpstream([b"a"], 200, {})
+            client.upstreams.append(upstream)
+            return upstream
+
+        client.send = send
+        response = await router.proxy.forward(_FakeRequest(b"{}"), "/v1/completions")
+        assert router.registry.state("r0").outstanding == 1, "precondition"
+        with pytest.raises(asyncio.CancelledError):
+            async for _chunk in response.body_iterator:
+                pass
+        return router.registry.state("r0").outstanding
+
+    assert asyncio.run(scenario()) == 0
+
+
+def test_a_completed_stream_releases_exactly_once():
+    """The guard is release_once, so the two paths cannot double-count."""
+    async def scenario():
+        router = _router(count=1)
+        response = await router.proxy.forward(_FakeRequest(b"{}"), "/v1/completions")
+        async for _chunk in response.body_iterator:
+            pass
+        # A second drain of an exhausted iterator must not release again.
+        with contextlib.suppress(Exception):
+            async for _chunk in response.body_iterator:
+                pass
+        return router.registry.state("r0").outstanding
+
+    assert asyncio.run(scenario()) == 0

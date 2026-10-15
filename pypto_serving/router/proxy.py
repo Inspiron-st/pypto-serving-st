@@ -132,6 +132,14 @@ class ReplicaProxy:
                 content={"object": "error", "message": f"replica {replica.name} is unreachable"},
                 headers={SESSION_HEADER: session_id},
             )
+        except BaseException:
+            # CancelledError is not an Exception, so the clause above does not
+            # see it. A client that goes away while we wait for headers would
+            # otherwise leave the replica carrying this request forever: the
+            # relay never starts, so nothing else releases the count, and the
+            # inflated load skews routing and stalls a drain that waits for it.
+            release_once()
+            raise
 
         headers = _filter_headers(upstream.headers, _DROP_RESPONSE)
         # Headers precede the body, so this is the only mechanism that returns
@@ -154,8 +162,12 @@ class ReplicaProxy:
             async for chunk in upstream.aiter_raw():
                 yield chunk
         finally:
+            # The release is itself in a finally: aclose() awaits, so it can be
+            # cancelled, and a CancelledError raised there would skip the
+            # release and strand the count exactly as above.
             try:
                 await upstream.aclose()
             except Exception:  # noqa: BLE001 - teardown must not mask the original exit
                 logger.debug("closing upstream to %s failed", replica_name, exc_info=True)
-            release_once()
+            finally:
+                release_once()
