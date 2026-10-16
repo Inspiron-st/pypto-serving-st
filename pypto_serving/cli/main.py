@@ -168,7 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="JSON",
         help=(
-            "GenerateConfig fields as a JSON object: max_new_tokens, "
+            "GenerateConfig fields as a JSON object: max_new_tokens, min_tokens, "
             "temperature, top_p, top_k, stop, stream, ignore_eos. Generate "
             "mode: the run's sampling config. Serve mode: server-wide defaults "
             "for request fields that are omitted (default: GenerateConfig "
@@ -575,6 +575,7 @@ def _validate_generate_config_options(options: dict[str, object]) -> None:
 
     checks: dict[str, tuple[str, object]] = {
         "max_new_tokens": ("a positive int", is_positive_int),
+        "min_tokens": ("a non-negative int", lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0),
         "temperature": ("a non-negative number", lambda v: is_number(v) and v >= 0),
         "top_p": ("a number in (0, 1]", lambda v: is_number(v) and 0 < v <= 1),
         "top_k": ("a positive int or null", lambda v: v is None or is_positive_int(v)),

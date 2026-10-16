@@ -27,6 +27,7 @@ from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import (
     OutputParserSpec, ParsedToolCall, ToolCallDelta, create_output_parser,
 )
+from pypto_serving.serving.sampling.capabilities import SamplingCapabilities, sampling_capabilities
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
     worker_step_timeout_seconds,
@@ -102,6 +103,15 @@ class EngineConfig:
         if self.async_scheduling is not None:
             return self.async_scheduling
         return True
+
+    def resolve_min_tokens(self, min_tokens: int) -> int:
+        """Return the minimum length supported by the selected decode path."""
+        return min_tokens if self.sampling_capabilities().honor_min_tokens else 0
+
+    def sampling_capabilities(self) -> SamplingCapabilities:
+        return sampling_capabilities(
+            self.executor_cls, self.resolve_runtime_config().num_speculative_tokens
+        )
 
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
@@ -435,9 +445,11 @@ class ReplicaEngineCore:
                 request_id=request_id,
                 prompt_token_ids=prompt_token_ids,
                 max_new_tokens=config.max_new_tokens,
+                min_tokens=self.config.resolve_min_tokens(getattr(config, "min_tokens", 0)),
                 arrival_time=time.time(),
                 stop_strings=tuple(config.stop) if config.stop else (),
-                eos_token_id=None if config.ignore_eos else self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                ignore_eos=config.ignore_eos,
                 temperature=config.temperature,
                 top_p=config.top_p,
                 top_k=config.top_k,
@@ -737,6 +749,9 @@ class ReplicaEngineCore:
                     top_p=req.top_p,
                     top_k=req.top_k,
                     seed=req.seed,
+                    min_tokens=req.min_tokens,
+                    eos_token_id=req.eos_token_id,
+                    initial_output_tokens=len(req.output_token_ids),
                     constraint_spec=req.constraint_spec.to_wire() if req.constraint_spec else None,
                 ))
                 self._worker_known_req_ids.add(req_id)
@@ -937,17 +952,25 @@ class ReplicaEngineCore:
             if ctx is None:
                 continue
 
+            if req_output.num_output_tokens is not None:
+                output_count = req_output.num_output_tokens
+            else:
+                output_count = len(ctx.request.output_token_ids)
             previous_text = ctx.detok_text
-            text = self._detokenize_incrementally(ctx)
+            text = self._detokenize_incrementally(ctx, end_offset=output_count)
             text_delta = (
                 text[len(previous_text) :]
                 if text.startswith(previous_text)
                 else ""
             )
 
-            if not req_output.finished and ctx.request.stop_strings:
+            if (req_output.new_token_id is not None
+                    and (not req_output.finished or req_output.finish_reason == "FINISHED_LENGTH")
+                    and ctx.request.stop_strings
+                    and output_count > ctx.request.min_tokens):
                 for stop in ctx.request.stop_strings:
                     if stop and text.endswith(stop):
+                        del ctx.request.output_token_ids[output_count:]
                         req_output.finished = True
                         req_output.finish_reason = "FINISHED_STOP"
                         self.scheduler.finish_request(
@@ -960,7 +983,7 @@ class ReplicaEngineCore:
                 stat_logger.record_output(
                     engine_index,
                     req_output.request_id,
-                    completion_tokens=len(ctx.request.output_token_ids),
+                    completion_tokens=output_count,
                 )
 
             if req_output.finished:
@@ -982,10 +1005,10 @@ class ReplicaEngineCore:
                 try:
                     truncated = req_output.finish_reason in ("FINISHED_LENGTH", "FINISHED_ABORTED")
                     if ctx.stream:
-                        parser_text_delta = self._detokenize_parser_incrementally(ctx)
+                        parser_text_delta = self._detokenize_parser_incrementally(ctx, end_offset=output_count)
                         token_ids = ctx.request.output_token_ids
-                        delta_token_ids = token_ids[ctx.parser_token_offset :]
-                        ctx.parser_token_offset = len(token_ids)
+                        delta_token_ids = token_ids[ctx.parser_token_offset : output_count]
+                        ctx.parser_token_offset = output_count
                         parsed = ctx.output_parser.feed(
                             parser_text_delta,
                             delta_token_ids,
@@ -1073,7 +1096,7 @@ class ReplicaEngineCore:
                 finished=req_output.finished,
                 finish_reason=req_output.finish_reason,
                 prompt_tokens=ctx.request.num_prompt_tokens,
-                completion_tokens=len(ctx.request.output_token_ids),
+                completion_tokens=output_count,
                 token_ids=(
                     tuple(ctx.request.output_token_ids)
                     if req_output.finished
@@ -1086,7 +1109,9 @@ class ReplicaEngineCore:
                 self._request_contexts.pop(req_output.request_id, None)
             ctx.queue.put_nowait(token_output)
 
-    def _detokenize_incrementally(self, ctx: _RequestContext) -> str:
+    def _detokenize_incrementally(
+        self, ctx: _RequestContext, *, end_offset: int | None = None
+    ) -> str:
         """Decode only the newly-completed text and append it to the running text.
 
         O(1) amortized per step (bounded decode window) instead of re-decoding
@@ -1104,10 +1129,13 @@ class ReplicaEngineCore:
             prefix_offset=ctx.detok_prefix_offset,
             read_offset=ctx.detok_read_offset,
             skip_special_tokens=True,
+            end_offset=end_offset,
         )
         return ctx.detok_text
 
-    def _detokenize_parser_incrementally(self, ctx: _RequestContext) -> str:
+    def _detokenize_parser_incrementally(
+        self, ctx: _RequestContext, *, end_offset: int | None = None
+    ) -> str:
         """Return newly released raw text for one stateful output parser."""
         (
             _,
@@ -1120,6 +1148,7 @@ class ReplicaEngineCore:
             prefix_offset=ctx.parser_detok_prefix_offset,
             read_offset=ctx.parser_detok_read_offset,
             skip_special_tokens=False,
+            end_offset=end_offset,
         )
         if delta:
             ctx.parser_detok_parts.append(delta)
@@ -1133,13 +1162,16 @@ class ReplicaEngineCore:
         prefix_offset: int,
         read_offset: int,
         skip_special_tokens: bool,
+        end_offset: int | None = None,
     ) -> tuple[str, int, int, str]:
         """Advance one bounded-context detokenizer and return its text delta."""
         if not output_ids:
             return text, prefix_offset, read_offset, ""
 
+        if end_offset is None:
+            end_offset = len(output_ids)
         prefix_ids = output_ids[prefix_offset:read_offset]
-        new_ids = output_ids[prefix_offset:]
+        new_ids = output_ids[prefix_offset:end_offset]
 
         def decode(token_ids: Sequence[int]) -> str:
             if skip_special_tokens:
@@ -1156,7 +1188,7 @@ class ReplicaEngineCore:
 
         delta = new_text[len(prefix_text) :]
         text += delta
-        read_offset = len(output_ids)
+        read_offset = end_offset
         prefix_offset = max(0, read_offset - 3)
         return text, prefix_offset, read_offset, delta
 

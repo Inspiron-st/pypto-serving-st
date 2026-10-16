@@ -52,7 +52,7 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":32}'
 ```
 
-Chat completions accept `model`, `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, `stream`, `reasoning_effort`, `include_reasoning`, and `chat_template_kwargs`. DeepSeek V4 also supports the function-tool fields described below.
+Chat completions accept `model`, `messages`, `max_completion_tokens`, `max_tokens`, `min_tokens`, `ignore_eos`, `temperature`, `top_p`, `top_k`, `stop`, `stream`, `reasoning_effort`, `include_reasoning`, and `chat_template_kwargs`. Both token-limit fields set the maximum generated tokens; a non-null `max_completion_tokens` takes precedence over `max_tokens`. `ignore_eos` overrides the server default for this request. `min_tokens` prevents EOS from being sampled until that many tokens have been generated, including when `ignore_eos` is true; it must not exceed the available generation length. When a structured-output grammar allows only EOS, DSpark permits EOS before the minimum length rather than leaving no valid token, matching vLLM's behavior. DeepSeek V4 without MTP and DSpark honor `min_tokens`. DeepSeek V4 MTP accepts it but currently treats its effective value as zero. DeepSeek V4 also supports the function-tool fields described below.
 
 The server converts chat messages to a prompt with the tokenizer's `apply_chat_template` method. `chat_template_kwargs` is forwarded to the tokenizer, which allows model-specific controls such as Qwen thinking-mode settings when the tokenizer supports them.
 

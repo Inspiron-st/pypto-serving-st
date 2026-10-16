@@ -17,7 +17,7 @@ import sys
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -26,9 +26,12 @@ from pypto_serving.config.types import (
     DecodeResult,
     PrefillBatch,
     SamplingParams,
+    StopTokenMask,
 )
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import ConstraintState, XGrammarProvider
+from pypto_serving.serving.sampling.capabilities import SamplingCapabilities
+from pypto_serving.serving.sampling.stop_rules import blocked_token_ids
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.utils.env import configure_runtime_logging
 from pypto_serving.serving.server.ipc import (
@@ -55,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 _DECODE_PIPELINE_SLOTS = 2
 _MISSING_REQUEST = object()
+_DEFAULT_SAMPLING_CAPABILITIES = SamplingCapabilities()
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,7 @@ class _PendingDecodeOutput:
     scheduled: tuple[DecodeRequest, ...]
     pending: object
     buffer_slot: int
+    batch: DecodeBatch
 
 
 @dataclass(frozen=True)
@@ -130,6 +135,7 @@ class WorkerProcess:
         profile_output_queue: mp.Queue | None = None,
     ):
         self.config = config
+        self._sampling_capabilities = config.sampling_capabilities()
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.profile_output_queue = profile_output_queue
@@ -146,6 +152,7 @@ class WorkerProcess:
         # substitutes from here. Entries cleared when a request is released.
         self._last_tokens: dict[str, list[int]] = {}
         self._constraint_states: dict[str, ConstraintState] = {}
+        self._accepted_output_lengths: dict[str, int] = {}
         self._xgrammar_provider: XGrammarProvider | None = None
 
     def init_device_and_model(self) -> int:
@@ -401,12 +408,18 @@ class WorkerProcess:
             assert isinstance(cmd, StepCommand)
             try:
                 self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
+                accepted_lengths = getattr(self, "_accepted_output_lengths", {})
+                # Both grammar and stop-token masks depend on committed output.
                 self._wait_for_pending_decode_reclaims(
                     [
                         request.request_id
                         for request in cmd.decode_requests
                         if (cached := self._req_cache.get(request.request_id)) is not None
-                        and cached.constraint_spec is not None
+                        and (cached.constraint_spec is not None
+                             or self._min_tokens_mask_active(
+                                 cached,
+                                 accepted_lengths.get(request.request_id, 0),
+                             ))
                     ]
                 )
                 self._wait_for_pending_prefill_reclaims(cmd.finished_request_ids)
@@ -479,6 +492,7 @@ class WorkerProcess:
                             scheduled=tuple(cmd.decode_requests),
                             pending=pending,
                             buffer_slot=prepared.buffer_slot,
+                            batch=dispatch_batch,
                         )
                     )
                 except Exception as exc:
@@ -646,7 +660,9 @@ class WorkerProcess:
             ):
                 decode_result = self.executor.reclaim_prepared_decode(work.pending)
                 new_tokens: dict[str, list[int]] = {}
-                num_draft_tokens = self._consume_decode_result(work.scheduled, decode_result, new_tokens)
+                num_draft_tokens = self._consume_decode_result(
+                    work.scheduled, decode_result, new_tokens, batch=work.batch
+                )
                 for req_id, tokens in new_tokens.items():
                     if tokens:
                         self._record_last_tokens(req_id, tokens)
@@ -669,20 +685,21 @@ class WorkerProcess:
         """
         assert prepared.batch is not None
         batch = prepared.batch
-        constrained_ids = [
-            request.request_id for request in scheduled
-            if self._req_cache[request.request_id].constraint_spec is not None
-        ]
-        if constrained_ids:
-            # Early prepare may precede registration on the command lane. Never
-            # reuse an empty/stale snapshot as an unconstrained dispatch.
-            states = {}
-            for request_id in constrained_ids:
-                state = self._constraint_states.get(request_id)
+        # Early prepare may precede registration on the command lane. Bind the
+        # live policy states only after the command has registered the request.
+        constraints = {}
+        stop_masks = {}
+        for request in scheduled:
+            cached = self._req_cache[request.request_id]
+            if cached.constraint_spec is not None:
+                state = self._constraint_states.get(request.request_id)
                 if state is None:
-                    raise RuntimeError(f"constraint state is not registered for {request_id!r}")
-                states[request_id] = state
-            batch = replace(batch, constraint_states=states)
+                    raise RuntimeError(f"constraint state is not registered for {request.request_id!r}")
+                constraints[request.request_id] = state
+            if mask := self._stop_token_mask(request.request_id):
+                stop_masks[request.request_id] = mask
+        if constraints or stop_masks or batch.constraint_states or batch.stop_token_masks:
+            batch = replace(batch, constraint_states=constraints, stop_token_masks=stop_masks)
         if not self.executor.prepared_decode_requires_token(prepared.prepared):
             return batch
         tokens = [self._resolve_decode_token(request) for request in scheduled]
@@ -744,6 +761,8 @@ class WorkerProcess:
         """Apply request release and registration on the FIFO device lane."""
         if not hasattr(self, "_constraint_states"):
             self._constraint_states = {}
+        if not hasattr(self, "_accepted_output_lengths"):
+            self._accepted_output_lengths = {}
         self._release_finished_request_state(
             cmd.finished_request_ids,
             expected_cache_entries=expected_cache_entries,
@@ -752,6 +771,7 @@ class WorkerProcess:
             previous_state = self._constraint_states.pop(new_request.request_id, None)
             if previous_state is not None:
                 previous_state.close()
+            self._accepted_output_lengths[new_request.request_id] = new_request.initial_output_tokens
             if new_request.constraint_spec is not None:
                 spec = ConstraintSpec.from_wire(new_request.constraint_spec)
                 if spec.provider_id != "xgrammar":
@@ -787,6 +807,7 @@ class WorkerProcess:
             constraint_state = getattr(self, "_constraint_states", {}).pop(req_id, None)
             if constraint_state is not None:
                 constraint_state.close()
+            getattr(self, "_accepted_output_lengths", {}).pop(req_id, None)
             release_sampler = getattr(self.sampler, "release_requests", None)
             if callable(release_sampler):
                 release_sampler([req_id])
@@ -906,6 +927,11 @@ class WorkerProcess:
 
     def _make_prefill_batch(self, scheduled: list[PrefillRequest], runtime_model) -> PrefillBatch:
         device = runtime_model.runtime.device
+        terminal = [
+            pr for pr in scheduled
+            if pr.num_computed_tokens + len(pr.chunk_tokens)
+            >= len(self._req_cache[pr.request_id].prompt_token_ids)
+        ]
         embedding_lookup = None
         if not self.executor.supports_device_embedding:
             embedding_lookup = lambda token_ids: self.executor.lookup_embeddings(runtime_model, token_ids)
@@ -916,18 +942,21 @@ class WorkerProcess:
             prompt_lens=[len(self._req_cache[pr.request_id].prompt_token_ids) for pr in scheduled],
             chunk_starts=[pr.num_computed_tokens for pr in scheduled],
             device=device, embedding_lookup=embedding_lookup,
-            allow_device_greedy_sampling=self._allow_device_sampled_ids(scheduled),
-            allow_device_topk_sampling=self._allow_device_topk_sampling(scheduled),
+            allow_device_greedy_sampling=self._allow_device_sampled_ids(terminal, phase="prefill"),
+            allow_device_topk_sampling=self._allow_device_topk_sampling(terminal, phase="prefill"),
             block_ids=[pr.block_ids for pr in scheduled],
             block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
             cache_partitions=[pr.cache_partition for pr in scheduled],
         )
         batch.constraint_states = {
             pr.request_id: state
-            for pr in scheduled
+            for pr in terminal
             if (state := getattr(self, "_constraint_states", {}).get(pr.request_id)) is not None
-            and pr.num_computed_tokens + len(pr.chunk_tokens)
-            >= len(self._req_cache[pr.request_id].prompt_token_ids)
+        }
+        batch.stop_token_masks = {
+            pr.request_id: mask
+            for pr in terminal
+            if (mask := self._stop_token_mask(pr.request_id)) is not None
         }
         return batch
 
@@ -967,12 +996,7 @@ class WorkerProcess:
                         if prefill_result.logits.dim() > 1
                         else prefill_result.logits
                     )
-                    params = SamplingParams(
-                        temperature=cached.temperature,
-                        top_p=cached.top_p,
-                        top_k=cached.top_k,
-                        seed=cached.seed,
-                    )
+                    params = self._sampling_params(pr.request_id)
                     token_id = self._sample_result_row(
                         prefill_result,
                         logits,
@@ -986,6 +1010,7 @@ class WorkerProcess:
                     constraint_state = getattr(self, "_constraint_states", {}).get(pr.request_id)
                     if constraint_state is not None:
                         constraint_state.accept((token_id,))
+                    self._accept_output_tokens(pr.request_id, 1)
                     completed_request_ids.append(pr.request_id)
                     completed_token_ids.append(token_id)
                     completed_sampling_params.append(params)
@@ -1057,14 +1082,16 @@ class WorkerProcess:
             # Placeholder tokens cannot be embedded correctly until the prior
             # device result is available. Keep this executor on the serial path.
             return None
+        if self._needs_host_stop_token_mask(cmd.decode_requests, "decode"):
+            return None
         # Constraints do not prevent acceptance-independent metadata preparation.
         # The device lane still waits for these requests' prior output reclaim
         # before touching matchers or drafts and staging the next mask.
         runtime_model = self.model_record.runtime_model
         if buffer_slot is None:
             buffer_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
-        allow_device_greedy_sampling = self._allow_device_sampled_ids(cmd.decode_requests)
-        allow_device_topk_sampling = self._allow_device_topk_sampling(cmd.decode_requests)
+        allow_device_greedy_sampling = self._allow_device_sampled_ids(cmd.decode_requests, phase="decode")
+        allow_device_topk_sampling = self._allow_device_topk_sampling(cmd.decode_requests, phase="decode")
         # Tokens remain placeholders during early preparation. Executors with a
         # host-token dependency may patch them on the device lane; fused MTP
         # consumes persistent state finalized by the terminal-prefill command.
@@ -1074,6 +1101,7 @@ class WorkerProcess:
             resolve_tokens=False,
             allow_device_greedy_sampling=allow_device_greedy_sampling,
             allow_device_topk_sampling=allow_device_topk_sampling,
+            bind_policy=False,
         )
         with profile_span(
             "WorkerProcess.prepare_decode",
@@ -1095,6 +1123,7 @@ class WorkerProcess:
         resolve_tokens: bool,
         allow_device_greedy_sampling: bool,
         allow_device_topk_sampling: bool,
+        bind_policy: bool = True,
     ) -> DecodeBatch:
         """Build a decode batch snapshot, optionally resolving prior output tokens."""
         device = runtime_model.runtime.device
@@ -1133,7 +1162,12 @@ class WorkerProcess:
                 dr.request_id: state
                 for dr in scheduled
                 if (state := getattr(self, "_constraint_states", {}).get(dr.request_id)) is not None
-            },
+            } if bind_policy else {},
+            stop_token_masks={
+                dr.request_id: mask
+                for dr in scheduled
+                if (mask := self._stop_token_mask(dr.request_id)) is not None
+            } if bind_policy else {},
         )
 
     def _batch_decode(
@@ -1148,8 +1182,8 @@ class WorkerProcess:
             cat="worker",
             args={"batch_size": len(scheduled), "request_ids": [dr.request_id for dr in scheduled]},
         ):
-            allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled)
-            allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
+            allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled, phase="decode")
+            allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled, phase="decode")
 
             batch = self._make_decode_batch(
                 scheduled,
@@ -1178,13 +1212,15 @@ class WorkerProcess:
                     batch,
                     prepared,
                 )
-            return self._consume_decode_result(scheduled, decode_result, new_tokens)
+            return self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
 
     def _consume_decode_result(
         self,
         scheduled: tuple[DecodeRequest, ...] | list[DecodeRequest],
         decode_result: DecodeResult,
         new_tokens: dict[str, list[int]],
+        *,
+        batch: DecodeBatch | None = None,
     ) -> dict[str, int]:
         """Convert a runner result to tokens on either serial or reclaim lane."""
         if decode_result.accepted_token_ids is not None:
@@ -1193,6 +1229,7 @@ class WorkerProcess:
                 constraint_state = getattr(self, "_constraint_states", {}).get(dr.request_id)
                 if constraint_state is not None:
                     constraint_state.accept(tokens)
+                self._accept_output_tokens(dr.request_id, len(tokens))
                 new_tokens[dr.request_id] = tokens
             if decode_result.num_draft_tokens is None:
                 return {}
@@ -1200,10 +1237,11 @@ class WorkerProcess:
                 dr.request_id: count
                 for dr, count in zip(scheduled, decode_result.num_draft_tokens, strict=True)
             }
-        allow_device_greedy_sampling = self._allow_device_sampled_ids(list(scheduled))
-        allow_device_topk_sampling = self._allow_device_topk_sampling(list(scheduled))
+        if batch is None:
+            raise RuntimeError("decode sampling requires the dispatched batch")
+        allow_device_greedy_sampling = batch.allow_device_greedy_sampling
+        allow_device_topk_sampling = batch.allow_device_topk_sampling
         for i, dr in enumerate(scheduled):
-            cached = self._req_cache[dr.request_id]
             logits = None
             if decode_result.logits is not None:
                 logits = (
@@ -1211,12 +1249,7 @@ class WorkerProcess:
                     if decode_result.logits.dim() > 1
                     else decode_result.logits
                 )
-            params = SamplingParams(
-                temperature=cached.temperature,
-                top_p=cached.top_p,
-                top_k=cached.top_k,
-                seed=cached.seed,
-            )
+            params = self._sampling_params(dr.request_id)
             token_id = self._sample_result_row(
                 decode_result,
                 logits,
@@ -1230,6 +1263,7 @@ class WorkerProcess:
             constraint_state = getattr(self, "_constraint_states", {}).get(dr.request_id)
             if constraint_state is not None:
                 constraint_state.accept((token_id,))
+            self._accept_output_tokens(dr.request_id, 1)
         return {}
 
     def close(self) -> None:
@@ -1238,6 +1272,8 @@ class WorkerProcess:
             constraint_state.close()
         if hasattr(self, "_constraint_states"):
             self._constraint_states.clear()
+        if hasattr(self, "_accepted_output_lengths"):
+            self._accepted_output_lengths.clear()
         executor = self.executor
         self.executor = None
         if executor is None:
@@ -1274,11 +1310,62 @@ class WorkerProcess:
                 params,
                 request_id,
             )
+        if logits is None or logits.numel() == 0:
+            raise ValueError("host sampling requires logits when device sampling is unavailable")
         return self.sampler.sample(logits, params, request_id)
 
-    def _allow_device_topk_sampling(self, scheduled: list) -> bool:
+    def _accept_output_tokens(self, request_id: str, count: int) -> None:
+        lengths = getattr(self, "_accepted_output_lengths", {})
+        if request_id in lengths:
+            lengths[request_id] += count
+
+    @staticmethod
+    def _min_tokens_mask_active(cached: NewRequestData, accepted_count: int) -> bool:
+        return cached.eos_token_id is not None and accepted_count < cached.min_tokens
+
+    def _stop_token_mask(self, request_id: str) -> StopTokenMask | None:
+        cached = self._req_cache[request_id]
+        if cached.min_tokens <= 0 or cached.eos_token_id is None:
+            return None
+        lengths = getattr(self, "_accepted_output_lengths", {})
+        if request_id not in lengths:
+            raise RuntimeError(f"accepted output length is not registered for {request_id!r}")
+        if not self._min_tokens_mask_active(cached, lengths[request_id]):
+            return None
+        remaining = cached.min_tokens - lengths[request_id]
+        stop_ids = blocked_token_ids((cached.eos_token_id,), remaining)
+        return StopTokenMask(stop_ids, remaining) if stop_ids else None
+
+    def _sampling_params(self, request_id: str) -> SamplingParams:
+        cached = self._req_cache[request_id]
+        mask = self._stop_token_mask(request_id)
+        forbidden = mask.stop_token_ids if mask is not None else ()
+        return SamplingParams(
+            temperature=cached.temperature, top_p=cached.top_p,
+            top_k=cached.top_k, seed=cached.seed,
+            forbidden_token_ids=forbidden,
+        )
+
+    def _needs_host_stop_token_mask(
+        self, scheduled: list, phase: Literal["prefill", "decode"]
+    ) -> bool:
+        capabilities = getattr(self, "_sampling_capabilities", _DEFAULT_SAMPLING_CAPABILITIES)
+        if capabilities.stop_mask_on_device(phase):
+            return False
+        return any(
+            self._stop_token_mask(item.request_id) is not None
+            for item in scheduled
+        )
+
+    def _allow_device_topk_sampling(
+        self, scheduled: list, *, phase: Literal["prefill", "decode"]
+    ) -> bool:
         """Return whether a scheduled batch can use executor top-k candidates."""
+        if not scheduled:
+            return False
         max_device_topk = self.executor.device_topk_sampling_k
+        if self._needs_host_stop_token_mask(scheduled, phase):
+            return False
         cached_requests = [self._req_cache[item.request_id] for item in scheduled]
         return (
             max_device_topk > 0
@@ -1288,9 +1375,15 @@ class WorkerProcess:
             and all(request.top_k <= max_device_topk for request in cached_requests)
         )
 
-    def _allow_device_sampled_ids(self, scheduled: list) -> bool:
+    def _allow_device_sampled_ids(
+        self, scheduled: list, *, phase: Literal["prefill", "decode"]
+    ) -> bool:
         """Return whether the executor can perform every request's sampling policy."""
+        if not scheduled:
+            return False
         if not self.executor.supports_device_sampling:
+            return False
+        if self._needs_host_stop_token_mask(scheduled, phase):
             return False
         requests = [self._req_cache[item.request_id] for item in scheduled]
         return all(

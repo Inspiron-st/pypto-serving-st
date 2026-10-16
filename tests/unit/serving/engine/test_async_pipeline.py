@@ -13,17 +13,21 @@ from types import SimpleNamespace
 
 import pytest
 
+from pypto_serving.config.types import GenerateConfig, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.engine.async_engine import (
+    EngineConfig,
     ReplicaEngineCore,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
+    ScheduledRequest,
     Scheduler,
     SchedulerConfig,
+    SchedulerOutput,
 )
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
@@ -34,6 +38,8 @@ from pypto_serving.serving.server.ipc import (
 
 
 class _Tokenizer:
+    eos_token_id: int | None = None
+
     def encode(self, text: str) -> list[int]:
         return [max(1, len(text))]
 
@@ -80,7 +86,10 @@ def _async_pipeline_core(*, num_speculative_tokens: int = 0):
     core.scheduler = scheduler
     core.kv_cache_manager = manager
     core.tokenizer = _Tokenizer()
-    core.config = SimpleNamespace(executor_cls="PyptoQwen14BExecutor")
+    core.config = EngineConfig(
+        executor_cls="PyptoQwen14BExecutor",
+        runtime_config=RuntimeConfig(num_speculative_tokens=num_speculative_tokens),
+    )
     core._async_scheduling = True
     core._pending_free_ids = []
     core._worker_known_req_ids = set()
@@ -252,6 +261,61 @@ def test_rejected_request_does_not_leave_an_engine_context():
         asyncio.run(consume())
     assert not core._request_contexts and not core.scheduler.requests
     assert not core._pending_free_ids
+
+
+@pytest.mark.parametrize("executor_cls,speculative_tokens,expected_min_tokens", [
+    ("PyptoQwen14BExecutor", 0, 2),
+    ("PyptoDeepSeekV4Executor", 1, 0),
+    ("PyptoDeepSeekV4DSparkExecutor", 7, 2),
+])
+def test_min_tokens_reaches_worker_registration(executor_cls, speculative_tokens, expected_min_tokens):
+    core, dispatched = _async_pipeline_core(num_speculative_tokens=speculative_tokens)
+    core.config.executor_cls = executor_cls
+    core.tokenizer.eos_token_id = 9
+
+    class Queued(Exception):
+        pass
+
+    async def enqueue():
+        async for _ in core.add_request(
+            "eos-policy", "prompt", GenerateConfig(max_new_tokens=4, min_tokens=2,
+                                                     ignore_eos=True),
+            prompt_token_ids=[1], on_queued=lambda: (_ for _ in ()).throw(Queued()),
+        ):
+            pass
+
+    with pytest.raises(Queued):
+        asyncio.run(enqueue())
+    request = core.scheduler.requests["eos-policy"]
+    assert request.eos_token_id == 9
+    assert request.ignore_eos is True
+    assert request.min_tokens == expected_min_tokens
+    assert core._try_dispatch_step()
+    assert len(dispatched[0].new_requests) == 1
+    registration = dispatched[0].new_requests[0]
+    assert registration.min_tokens == expected_min_tokens
+    assert registration.eos_token_id == 9
+    assert registration.initial_output_tokens == 0
+
+
+def test_restarted_request_registers_committed_output_length():
+    core, _ = _async_pipeline_core()
+    request = Request(
+        request_id="restarted", prompt_token_ids=[1, 2], max_new_tokens=6,
+        min_tokens=3, eos_token_id=9, output_token_ids=[7, 8],
+        status=RequestStatus.PREEMPTED,
+    )
+    core._worker_known_req_ids.add(request.request_id)
+    scheduled = SchedulerOutput(scheduled_requests=[
+        ScheduledRequest(request=request, num_new_tokens=1, is_prefill=True),
+    ])
+
+    command = core._build_step_command(scheduled, [request.request_id])
+
+    assert command.finished_request_ids == [request.request_id]
+    assert len(command.new_requests) == 1
+    assert command.new_requests[0].initial_output_tokens == 2
+    assert command.new_requests[0].min_tokens == 3
 
 
 def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
