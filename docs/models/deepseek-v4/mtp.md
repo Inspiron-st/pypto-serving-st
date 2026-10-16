@@ -1,8 +1,8 @@
-# DeepSeek V4
+# DeepSeek V4 MTP
 
-PyPTO Serving supports DeepSeek V4 Flash through a converted W8A8 compressed-tensors checkpoint and a fixed eight-device NPU topology. The model uses overlapped attention data parallelism and MoE expert parallelism: the same eight physical ranks are attention DP=8 and MoE EP=8 ranks.
+PyPTO Serving supports DeepSeek V4 Flash through a converted W8A8 compressed-tensors checkpoint. The MTP deployment below uses eight devices with overlapped attention DP and MoE EP. [DSpark deployment](dspark.md) uses TP4 groups on eight or 16 devices.
 
-## Requirements
+## MTP Requirements
 
 - A converted W8A8 compressed-tensors checkpoint.
 - Exactly eight NPU device IDs.
@@ -18,7 +18,34 @@ PyPTO Serving expects a DeepSeek V4 W8A8 compressed-tensors checkpoint. The Deep
 
 The conversion can run on CPU and does not require `torch_npu`. The source and output directories must be different, and the host must have enough free disk space for both copies.
 
-Run the repository conversion utility documented in [DeepSeek V4 Conversion](../cli-reference/deepseek-v4-conversion.md). The converter writes one safetensors shard at a time using atomic replacement and supports resumable conversion after an interrupted run.
+Install the conversion dependencies using the PyTorch build validated for your Ascend environment:
+
+```bash
+python -m pip install --upgrade huggingface_hub safetensors
+python -c "import torch, safetensors; print(torch.__version__)"
+```
+
+Download the source checkpoint, or use an existing local snapshot:
+
+```bash
+hf download deepseek-ai/DeepSeek-V4-Flash \
+  --local-dir /path/to/DeepSeek-V4-Flash
+```
+
+Preview the conversion, then run it:
+
+```bash
+python scripts/convert_deepseek_v4_to_w8a8.py \
+  --input-dir /path/to/DeepSeek-V4-Flash \
+  --output-dir /path/to/dsv4-flash-w8a8 \
+  --dry-run
+
+python scripts/convert_deepseek_v4_to_w8a8.py \
+  --input-dir /path/to/DeepSeek-V4-Flash \
+  --output-dir /path/to/dsv4-flash-w8a8
+```
+
+The converter writes one safetensors shard at a time using atomic replacement. If interrupted, rerun the conversion with `--resume` to validate and skip completed shards. `--input-dir` and `--output-dir` are required; `--dry-run` validates the source and prints the plan without writing files.
 
 A successful run prints `Conversion complete` and leaves a converted `config.json`, `model.safetensors.index.json`, safetensors shards, and a `.pypto-w8a8-conversion.json` marker in the output directory.
 
@@ -89,7 +116,7 @@ curl --noproxy "*" http://127.0.0.1:8225/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":32}'
 ```
 
-Pass `"reasoning_effort":"high"` or `"chat_template_kwargs":{"enable_thinking":true}` to use the model's thinking prompt. An explicit `enable_thinking` value takes priority when both are given. The API supports text messages with system, user, developer, assistant, and `latest_reminder` roles, plus assistant function calls and tool-result messages. See [Function Tools](online-serving.md#deepseek-v4-function-tools) for request fields, streaming deltas, and client-side execution. Multimodal content is not exposed by the request schema. Generation defaults to greedy sampling (`temperature=0`).
+Pass `"reasoning_effort":"high"` or `"chat_template_kwargs":{"enable_thinking":true}` to use the model's thinking prompt. An explicit `enable_thinking` value takes priority when both are given. The API supports text messages with system, user, developer, assistant, and `latest_reminder` roles, plus assistant function calls and tool-result messages. See [Tool Calling](../../user-guide/tool-calling.md) for the client workflow and [Function Tool Format](index.md#function-tool-format) for DeepSeek-specific limits. Multimodal content is not exposed by the request schema. Generation defaults to greedy sampling (`temperature=0`).
 
 The main prefill kernel accepts a dynamic request extent up to 8192 tokens and walks it internally in 128-token tiles. The effective dispatch extent is the minimum of 8192, `--max-num-batched-tokens`, `--long-prefill-token-threshold`, and `--max-model-len`. An 8191-token prompt can therefore use one 8192-row main-prefill dispatch when those configured limits permit it, instead of 64 serving dispatches.
 
@@ -98,18 +125,10 @@ shared artifact directory. PyPTO validates source, specialization and toolchain
 identities before reusing generated code and binaries. Leave
 `PYPTO_PROG_BUILD_DIR` unset for reuse: explicitly requesting build output
 bypasses caching. The old named build slots are not reused. See the
-[compile cache reference](../cli-reference/pypto-serving.md) for read-only mode,
+[JIT cache guide](../../developer-guide/jit-cache.md) for read-only mode,
 configuration precedence and cold-start costs.
 
 For MTP K greater than 1, prefix caching is disabled automatically. For routine DeepSeek V4 serving, pass `--no-enable-prefix-caching` unless you are explicitly validating prefix-cache behavior.
-
-## Weight Staging
-
-The 49 per-layer weights are described declaratively in `pypto_serving/model/deepseek/weight_spec.py` and evaluated by the shared pipeline documented in [Weight Staging](../developer-guide/weight-staging.md). DeepSeek V4 stages serially on purpose: packing one layer allocates roughly 8 GB of intermediates, so overlapping layers increases peak memory instead of hiding latency.
-
-DeepSeek V4 layers form three slab groups: `fwd` over all layers, `csa` over the `compress_ratio==4` layers, and `hca` over the `compress_ratio==128` layers. Each group stores its layers contiguously in first-appearance order.
-
-See [Prepacked Weights](#prepacked-weights) for the optional sidecar that reduces repeated startup work.
 
 ## Prepacked Weights
 
@@ -117,19 +136,17 @@ DeepSeek V4 hidden-layer weights can be converted once into the rank-stacked hos
 
 ### Build the Sidecar
 
-Use the [`pypto-prepack-deepseek-v4`](../cli-reference/pypto-prepack-deepseek-v4.md) CLI after converting a DeepSeek V4 Flash checkpoint to the W8A8 layout. The default sidecar path is `pypto-deepseek-v4-stacked-r8.safetensors` beside the checkpoint.
+After converting the checkpoint, build the optional sidecar with the installed command:
+
+```bash
+pypto-prepack-deepseek-v4 /path/to/dsv4-flash-w8a8
+```
+
+The default sidecar path is `pypto-deepseek-v4-stacked-r8.safetensors` beside the checkpoint. `--output PATH` selects another path, and `--ranks N` sets the packed rank count (default `8`). Use `--force` to replace an existing sidecar after changing checkpoint shards or the packed rank layout.
 
 ### Runtime Behavior
 
-On startup, the DeepSeek V4 loader samples the sidecar's Linux page-cache residency before opening it, then validates a hot sidecar against the checkpoint-file and deployment fingerprint. A hot, valid sidecar is memory mapped as the final layout instead of repacking every hidden layer.
-
-A cold, missing, or stale sidecar falls back to the original checkpoint path, avoiding a cold 323 GiB page-fault stream on the weight-upload path. Rebuild with `--force` after replacing checkpoint shards or changing the packed rank layout.
-
-### Layout Contract
-
-The sidecar layout follows the order produced by `DEEPSEEK_V4_LAYER_RULES`, and its metadata records a name-to-offset map built from that order. Reordering the rule table invalidates already-written sidecars.
-
-The fingerprint covers the config, weight map, and each source shard's size and modification time, which lets startup detect a stale sidecar instead of silently using the wrong layout.
+On startup, a hot, valid sidecar is memory mapped instead of repacking hidden layers. A cold, missing, or stale sidecar falls back to the checkpoint path. Rebuild it with `--force` after replacing shards or changing the packed rank layout. The [sidecar contract](mtp-internals.md#prepacked-sidecar-contract) describes validation and layout details.
 
 ## Completion Check
 

@@ -1,51 +1,18 @@
-# DeepSeek V4 DSpark NPU Serving Dev Notes
+# DeepSeek V4 DSpark Internals
 
-Serving notes for the DSpark target kernels
-(`pypto-lib/models/deepseek_v4_flash_dspark`): the 16-card TP4/DP4/EP16
-deployment of the DeepSeek-V4-Flash W8A8 checkpoint with the DSpark decode
-tile (64 requests x 8 rows per TP group), block size 32, and the paged
-full-context prefill tables.
+This page describes the DSpark runner and kernel contracts. For checkpoint preparation, supported flags, and an HTTP smoke test, see [DSpark Deployment](dspark.md).
 
-Serving supports target-only greedy generation (K=0) and the DSpark
-speculative chain (K=7), including grouped prefix caching for both modes.
+## Implementation Entry Points
 
-## Topology and selection
+| Layer | Interface and responsibility |
+| --- | --- |
+| CLI | `cli/main.py` selects `PyptoDeepSeekV4DSparkExecutor` in `_executor_cls_for_model_family`, validates TP4/EP topology in `_validate_dspark_topology`, and builds seven cache groups in `_build_runtime_config`. |
+| Executor | `model/deepseek_dspark/npu_executor.py`: `DeepSeekV4DSparkPyptoExecutor._compile_model()` imports and compiles the DSpark prefill/decode programs; `_create_runner()` constructs the runner. |
+| Runner | `model/deepseek_dspark/npu_runner.py`: `DSparkModelRunner.init_kv_cache()` allocates post-weight pools; `prepare_prefill_inputs()` and `prepare_decode_inputs()` lower scheduler batches into the frozen kernel ABI. |
+| Worker | `serving/server/serving_worker.py`: `_make_prefill_batch()` and `_make_decode_batch()` pass group block IDs and cache partitions; `_batch_prefill()` calls `finalize_prefill()` for terminal chunks. |
+| Weights | `model/deepseek_dspark/weight_loader.py`: `DSparkWeightStore` packs target slabs and, for K=7, the three-layer drafter bank. |
 
-DSpark serves the same W8A8 checkpoint format as the MTP variant
-(`docs/cli-reference/deepseek-v4-conversion.md` describes the conversion). Select it with the
-speculative-config method:
-
-```bash
-python -m pypto_serving.cli \
-  --model /data/models/dsv4-flash-0731-dspark-w8a8 \
-  --backend npu --platform a2a3 \
-  --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
-  --dp 4 --ep 16 --tp 4 \
-  --block-size 32 --max-model-len 1024 --max-num-seqs 8 \
-  --max-num-batched-tokens 8192 --long-prefill-token-threshold 128 \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":0}' \
-  --no-enable-prefix-caching \
-  --ring-heap 2147483648,2147483648,4294967296,8589934592 \
-  --port 8000
-```
-
-Validated constraints (enforced at startup):
-
-- Exactly 16 devices with `--dp 4 --ep 16 --tp 4`. The 16 ranks form 4 TP
-  groups; `moe.py` rescales `n_routed_experts` by `EP/16`, so other EP values
-  compile a wrong expert view.
-- `--block-size 32` for raw KV pages. Compressed pages cover 128 source
-  tokens, matching MTP: one HCA row or 32 C4/indexer rows per page.
-- `--max-num-seqs` at most 256 (64 requests per TP group).
-- `--max-model-len` at most 1,048,576, including prompt and generated output.
-  Prefill chunks long prompts through the 8192-token dispatch bound. Serving
-  sizes the full-history compressed and index pools from the configured limit,
-  while the raw KV and compressor-state pools remain bounded rings.
-- Prefix caching supports both K=0 and K=7 via `--enable-prefix-caching`.
-  Grouped hits align to 128 source tokens (one full HCA compressed page).
-  K=0 leaves at least one token for prefill; K=7 leaves at least 128 tokens
-  to rebuild the drafter context, so its first possible hit needs a prompt
-  of at least 256 tokens. K=0 needs at least 129 tokens.
+The CLI accepts two or four TP4 groups (`--ep 8` or `16`, with `--dp 2` or `4`). The 16-rank deployment discussed below has four scheduler cache partitions. Physical block IDs are local to each partition and replicated across its four TP ranks.
 
 ## Prefix caching
 
@@ -57,6 +24,10 @@ The seven target cache families use the shared grouped prefix-cache manager.
 Lookup selects the TP partition with the longest reusable prefix, sharing
 full compressed-history pages and the immutable rolling tail. The allocator
 detaches rolling write destinations before continuing a shared prefix.
+`build_dspark_cache_group_specs()` defines these groups; `DSparkModelRunner.init_kv_cache()`
+allocates their replicated device pools after weights are materialized. The scheduler
+hands each batch `block_ids_by_group` and `cache_partitions`, which
+`DSparkCacheMetadataBuilder` lowers into the tables and slot mappings used by the kernels.
 Rolling pool capacities include both the configured prefill chunk and the
 historical window, because prefill writes its whole chunk before attention
 reads the prefix. The pool budget follows the active chunk limit; the CSA
@@ -76,6 +47,14 @@ back to an earlier aligned hit or a cold prefill.
 The checkpoint's `max_position_embeddings` must cover the requested Serving limit.
 
 ## How the deployment maps onto the kernels
+
+`DeepSeekV4DSparkPyptoExecutor._compile_model()` loads the PyPTO programs from
+`pypto-lib/models/deepseek_v4_flash_dspark`. `DSparkModelRunner.prepare_prefill_inputs()`
+and `prepare_decode_inputs()` translate `PrefillBatch` and `DecodeBatch` into
+kernel metadata; `run_prefill()` and `run_decode()` dispatch them. The worker
+calls `finalize_prefill()` for terminal chunks so a K=7 request has drafter
+state before decode. These interfaces are the handoff points to inspect when
+changing the kernel ABI.
 
 - **Cache partitions = TP groups.** The scheduler sees 4 partitions. Every
   rank of a group holds an identical replicated pool: prefill writes the same
@@ -131,6 +110,26 @@ The checkpoint's `max_position_embeddings` must cover the requested Serving limi
   to 32 storage rows; the unpadded prefill slabs are derived from the same
   data. The output projection is TP-sharded (2 of 8 groups per rank) and
   regathered on device.
+
+## Constrained Decode ABI
+
+`serving/constraints/provider.py` owns the request-local XGrammar state. The worker
+passes it with terminal prefill and decode batches; `DSparkModelRunner._stage_prefill_grammar()`
+and `_stage_decode_grammar()` copy allowed-token masks into the buffers defined in
+`model/deepseek_dspark/task_args.py`. The prefill and decode positional ABIs both
+include `grammar_mask`; fused K7 decode also includes `valid_draft_counts`.
+Serving and PyPTO-Lib must therefore be upgraded together.
+
+Ordinary requests reuse immutable all-allowed masks and default draft counts.
+The mask's row-mode header occupies segment 0's last padding word: `-1` selects
+ordinary argmax, while `0` enables masking. The header is packed by Serving,
+not supplied by XGrammar. Constrained requests reuse request-local host bitmask
+storage. Draft validation and mask generation share one speculative traversal,
+then roll back; only committed output advances the grammar. With asynchronous
+scheduling, acceptance-independent metadata may prepare early, but mask
+planning waits for that request's prior output to commit. Mutable slot ownership
+lasts through output reclaim, and masks still use the full-tensor runtime upload
+path rather than partial host-to-device updates.
 
 ## Ring heaps
 
@@ -196,6 +195,14 @@ Select with `--speculative-config '{"method": "dspark",
 "num_speculative_tokens": 7}'`; `0` keeps the target-only path. K is fixed at
 `DSPARK_QUERY_WIDTH = 7` -- the decode tile is exactly one committed row plus
 seven draft rows.
+
+The runner owns the request-to-lease map in `_drafter_states`.
+`_reserve_drafter_state()` and `release_finished_requests()` manage its lifetime;
+`_seed_prefill_wave()` establishes the initial context after terminal prefill.
+For decode, `_prepare_decode_plan()` and `_stage_device_prepared_decode()` build
+the target inputs; `_accept_decode_outputs_on_device()` and
+`_accept_decode_outputs_on_host()` apply the accepted chain. Keep the scheduler's
+committed lengths as the source of truth when changing any of these steps.
 
 **Programs.** `l3_dspark_drafter` (59 args at the pinned pypto-lib) and
 `l3_distributed_markov_sample` (12 args) compile alongside the target

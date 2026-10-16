@@ -71,11 +71,7 @@ pypto-serving \
 
 ## Weight Staging
 
-Layer weights are described in `pypto_serving/model/qwen/weight_spec.py` and staged by the shared pipeline documented in [Weight Staging](../developer-guide/weight-staging.md).
-
-The loader reads metadata only for the per-layer weights. Each layer is read, written into its slab slice, and dropped before the next one, which keeps the staging peak at roughly one layer per worker instead of a second copy of the model. The globals stay eager because `Executor.lookup_embeddings` reads `embed_tokens` at request time.
-
-Qwen-specific details: layers stack on axis 0 because there is no rank axis, projections are stored transposed so every projection rule carries `transpose=True`, and slabs are allocated in shared memory because the upload reads them from a forked child. A checkpoint without QK norms is a supported variant; the rules default those gammas to ones.
+The loader stages per-layer weights without keeping a second full model copy. Its host slabs use shared memory because upload reads them from a forked child. A checkpoint without QK norms is supported; the missing gamma weights default to ones. See [Weight Staging](../developer-guide/weight-staging.md) for the shared loading flow.
 
 ## Runtime Notes
 
