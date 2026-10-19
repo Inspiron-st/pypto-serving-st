@@ -221,7 +221,21 @@ class ServingRouter:
                 content={"object": "error",
                          "message": f"replica {name!r} was not launched by this router"},
             )
-        await self.fleet.stop(name)
+        stopped = await self.fleet.stop(name)
+        if not stopped:
+            # Out of rotation, but its devices are in an unknown state, so the
+            # slot stays reserved rather than being handed to the next launch.
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "object": "error",
+                    "message": (
+                        f"replica {name!r} was removed from routing but could not be "
+                        "confirmed stopped; its slot stays reserved"
+                    ),
+                    "capacity": self.fleet.capacity(),
+                },
+            )
         return JSONResponse({"name": name, "stopped": True,
                              "capacity": self.fleet.capacity()})
 

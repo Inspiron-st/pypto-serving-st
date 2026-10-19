@@ -63,7 +63,7 @@ def _hosts(local_devices=(0,), remote_devices=(0, 1)) -> tuple[HostSpec, ...]:
 
 
 def _fleet(*, initial=0, max_replicas=None, transport=None, state_path=None,
-           hosts=None, replicas=(), drain_timeout=5.0, launch_timeout=5.0):
+           hosts=None, replicas=(), drain_timeout=5.0, launch_timeout=5.0, probe=None):
     config = RouterConfig(
         replicas=replicas,
         hosts=_hosts() if hosts is None else hosts,
@@ -78,6 +78,7 @@ def _fleet(*, initial=0, max_replicas=None, transport=None, state_path=None,
     fake = transport if transport is not None else _FakeTransport()
     manager = FleetManager(
         config, registry, transport_factory=lambda _host: fake, state_path=state_path,
+        probe=probe,
     )
     return manager, registry, fake
 
@@ -522,6 +523,7 @@ def test_get_replicas_reports_the_fleet_and_what_is_left():
     assert payload["replicas"][0]["owned"] is True
     assert payload["capacity"] == {
         "owned": 1, "ceiling": 3, "free_slots": ["node02-d0", "node02-d1"],
+        "unconfirmed_stops": [],
     }
 
 
@@ -792,3 +794,63 @@ async def _payload_of(transport, host, pool, slot, capture):
         )
     finally:
         launcher_module._run_and_wait = original
+
+
+# --- an unconfirmed stop keeps its slot --------------------------------------
+#
+# Review on #254: a slot used to go back to the pool whether or not the replica
+# had actually stopped. A failed stop command, or an endpoint still answering
+# after the grace period, would hand those devices to the next launch and
+# overlap two instances on the same cards.
+
+
+def test_a_failed_stop_command_keeps_the_slot_reserved():
+    async def scenario():
+        transport = _FakeTransport()
+        fleet, registry, _fake = _fleet(transport=transport)
+        await fleet.launch_one()
+        registry.set_ready("local-d0", True)
+
+        transport.fail = LaunchError("pkill: operation not permitted")
+        stopped = await fleet.stop("local-d0", drain=False)
+        return stopped, fleet.capacity()
+
+    stopped, capacity = asyncio.run(scenario())
+    assert stopped is False
+    assert "local-d0" not in capacity["free_slots"]
+    assert capacity["unconfirmed_stops"] == ["local-d0"]
+
+
+def test_an_endpoint_still_answering_keeps_the_slot_reserved():
+    """A silent endpoint is weak evidence of exit; a noisy one is conclusive
+    evidence of the opposite."""
+    async def scenario():
+        async def always_answers(_spec):
+            return True
+
+        fleet, registry, _fake = _fleet(probe=always_answers)
+        await fleet.launch_one()
+        registry.set_ready("local-d0", True)
+        stopped = await fleet.stop("local-d0", drain=False)
+        return stopped, fleet.capacity()
+
+    stopped, capacity = asyncio.run(scenario())
+    assert stopped is False
+    assert capacity["unconfirmed_stops"] == ["local-d0"]
+
+
+def test_a_confirmed_stop_still_frees_the_slot():
+    async def scenario():
+        async def never_answers(_spec):
+            return False
+
+        fleet, registry, _fake = _fleet(probe=never_answers)
+        await fleet.launch_one()
+        registry.set_ready("local-d0", True)
+        stopped = await fleet.stop("local-d0", drain=False)
+        return stopped, fleet.capacity()
+
+    stopped, capacity = asyncio.run(scenario())
+    assert stopped is True
+    assert capacity["unconfirmed_stops"] == []
+    assert "local-d0" in capacity["free_slots"]

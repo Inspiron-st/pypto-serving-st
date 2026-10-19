@@ -381,21 +381,27 @@ class HostPool:
         )
         return LaunchedReplica(slot=slot, spec=slot.replica_spec())
 
-    async def signal_stop(self, slot: Slot) -> None:
+    async def signal_stop(self, slot: Slot) -> bool:
         """Ask a replica to stop. Does not release the slot.
 
         Signalling is not stopping: a stop command returns as soon as the signal
         is delivered, while the replica takes seconds more to shut its worker
         down and let go of its port. The slot stays taken until the caller has
         confirmed it is really gone, or a relaunch could race the port.
+
+        Returns whether the command itself succeeded. A failure is reported
+        rather than raised -- the caller decides what an unconfirmed stop means
+        for the slot -- but it must not be read as "stopped".
         """
         transport = self._transport_factory(slot.host)
         try:
             await transport.run(slot.host, self.stop_argv(slot), {}, detach=False)
         except LaunchError as exc:
-            # A stop command that fails leaves the device in an unknown state.
-            # Reported, not raised: refusing to ever reuse the slot is worse.
+            # A stop command that fails leaves the device in an unknown state,
+            # so the caller must not treat the slot as reclaimed.
             logger.warning("stopping replica %s failed: %s", slot.name, exc)
+            return False
+        return True
 
 
 @dataclass

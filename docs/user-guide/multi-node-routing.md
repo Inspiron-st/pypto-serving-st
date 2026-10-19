@@ -197,6 +197,8 @@ curl -s http://localhost:8000/replicas             # the fleet, and what is left
 
 `DELETE` drains first — the replica stops taking new sessions, its pinned sessions are released so they re-route on their next turn, and only once its in-flight requests finish (or `--drain-timeout`, default 300s, expires) is it stopped.
 
+A slot only returns to the pool once the stop is confirmed: the stop command has to succeed *and* the replica's address has to go quiet within the grace period. If either fails, the replica is out of rotation but its devices are in an unknown state — a dead HTTP endpoint does not prove the serving process and its device workers have exited — so the slot stays reserved, `DELETE` answers `500`, and the slot is listed under `capacity.unconfirmed_stops`. Freeing it is a manual decision: the alternative is launching onto cards another instance may still hold.
+
 Startup output goes to `<log_dir>/<slot>.log` on the machine that runs the replica. A launch is detached, so that file is the only place a failed model load can be diagnosed.
 
 ### Security

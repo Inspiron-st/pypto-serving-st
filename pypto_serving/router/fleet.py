@@ -68,6 +68,11 @@ class FleetManager:
         self._owned: dict[str, Slot] = {}
         self._watchers: dict[str, asyncio.Task] = {}
         self._draining: dict[str, asyncio.Task] = {}
+        # Slots whose replica could not be confirmed stopped. They stay taken
+        # in the pool, so nothing is launched onto devices that may still be
+        # in use, and they are reported so an operator can see why the
+        # capacity is lower than the configuration says.
+        self._unconfirmed: dict[str, Slot] = {}
 
     @property
     def pool(self) -> HostPool:
@@ -82,6 +87,8 @@ class FleetManager:
             "owned": len(self._owned),
             "ceiling": self._pool.ceiling,
             "free_slots": [slot.name for slot in self._pool.free_slots()],
+            # Reserved but not serving: a stop that could not be confirmed.
+            "unconfirmed_stops": sorted(self._unconfirmed),
         }
 
     # --- growing ----------------------------------------------------------
@@ -169,32 +176,61 @@ class FleetManager:
         if drain:
             await self._drain(name)
         state = self._registry.remove(name)
-        await self._pool.signal_stop(slot)
+        signalled = await self._pool.signal_stop(slot)
         # Only now is the device really free. Releasing the slot on the signal
         # alone would let the next launch bind a port the old replica still
         # holds, and that failure would look like a bad configuration.
+        gone = True
         if state is not None:
-            await self._wait_gone(state.spec)
-        self._pool.release(name)
+            gone = await self._wait_gone(state.spec)
+
         self._owned.pop(name, None)
+        if not (signalled and gone):
+            # The replica is out of rotation either way, but its devices are in
+            # an unknown state: the stop command failed, or something is still
+            # answering. Reusing them could overlap two instances on the same
+            # cards, so the slot stays reserved and the retirement is reported
+            # as incomplete. Freeing it is a human decision for now.
+            self._unconfirmed[name] = slot
+            self._write_state()
+            logger.error(
+                "replica %s could not be confirmed stopped (signalled=%s, gone=%s); "
+                "slot %s stays reserved",
+                name, signalled, gone, slot.name,
+            )
+            return False
+
+        self._pool.release(name)
         self._write_state()
         logger.info("replica %s stopped; slot %s is free", name, slot.name)
         return True
 
-    async def _wait_gone(self, spec: ReplicaSpec, timeout: float = STOP_GRACE_SECONDS) -> None:
-        """Wait until nothing answers at a stopped replica's address."""
+    async def _wait_gone(self, spec: ReplicaSpec, timeout: float = STOP_GRACE_SECONDS) -> bool:
+        """Wait until nothing answers at a stopped replica's address.
+
+        Returns whether the endpoint went quiet within the timeout. A silent
+        endpoint is weak evidence -- it says the HTTP server is gone, not that
+        the serving process and its device workers have exited -- but a *noisy*
+        one is conclusive: something is still there, so the devices are not free.
+
+        TODO: a stronger check needs a verifiable identity for what was launched
+        (a pid, or the broker task id where there is a broker) instead of an
+        address. Worth a configurable per-host probe, like ``stop_command``, if
+        the endpoint test proves too weak in practice.
+        """
         if self._probe is None:
-            return
+            return True
         waited = 0.0
         while waited < timeout:
             if not await self._probe(spec):
-                return
+                return True
             await asyncio.sleep(0.5)
             waited += 0.5
-        logger.warning(
-            "%s still answered %s after %.0fs; reusing its slot anyway",
+        logger.error(
+            "%s still answered %s after %.0fs; keeping its slot reserved",
             spec.name, spec.base_url, timeout,
         )
+        return False
 
     async def _drain(self, name: str) -> None:
         """Stop routing to a replica and wait for its in-flight work.
