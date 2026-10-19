@@ -23,17 +23,10 @@ pypto_serving/
   worker/                      Simpler worker wrapper for NPU dispatch
   tools/profile/               Chrome-trace profiling support
 pypto-lib/                     submodule providing model-specific PyPTO kernels
-platform/                      C++ platform-management layer (engine lifecycle, channels, modules)
 scripts/
   convert_deepseek_v4_to_w8a8.py  DeepSeek V4 checkpoint converter
 tests/                         host-side unit tests and CI NPU accuracy guards
 ```
-
-## Platform
-
-The `platform/` subtree is the first-party C++ platform-management layer for PyPTO Serving. It is separate from the Python model-serving path and manages distributed-system bootstrap, deployment metadata, channel lifecycle, module services, and instance lifecycle. Model support keeps ownership of LLM-specific behavior (batching, KV cache policy, token scheduling, sampling, execution), while the platform orchestrates and supervises instances without sitting in the per-token execution hot path.
-
-It is built around `serving::system::Engine`, which owns a set of `serving::modules::Module` instances and starts, supervises, and finalizes them across instances over RPC, using host-side channel primitives for control traffic. See [`platform/docs/README.md`](platform/docs/README.md) for the full design split, source layout, and runtime shape.
 
 ## Quick Checks
 
