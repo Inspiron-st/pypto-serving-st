@@ -169,33 +169,3 @@ jobs:
         with:
           checkout-path: dist-checkout
 
-  platform-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          submodules: recursive
-          persist-credentials: false
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y meson ninja-build libhwloc-dev libboost-context-dev libopenmpi-dev
-          python3 -m pip install 'clang-format==18.1.0'
-
-      - name: Check style
-        run: |
-          python3 platform/extern/HiCR/extern/run-clang-format/run-clang-format.py \
-            --recursive platform/include platform/examples \
-            --extensions "hpp,cpp" --exclude "*/build/*"
-
-      - name: Configure
-        run: meson setup platform/build platform/ -Dengines=mpi -DbuildTests=true
-
-      - name: Build
-        run: ninja -C platform/build
-
-      - name: Test
-        run: meson test -C platform/build --suite examples --timeout-multiplier 2

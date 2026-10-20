@@ -32,7 +32,6 @@ The API process receives HTTP requests and forwards generation work to `AsyncLLM
 
 Worker startup is also part of the capacity contract: `WorkerProcess.init_device_and_model()` loads the checkpoint through `ModelLoader`, selects the configured executor, and calls `register_model()`. The runner uploads persistent weights and allocates device KV pools before reporting their actual capacity to the engine. Only then does the scheduler use the available page count.
 
-The C++ `platform/` subtree is a separate platform-management layer and is not in the per-token Python serving hot path.
 
 ## Scheduler and KV Cache
 

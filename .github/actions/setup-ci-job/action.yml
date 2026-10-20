@@ -239,9 +239,7 @@ runs:
       uses: actions/checkout@v4
       with:
         path: ${{ inputs.checkout-path }}
-        # pypto-lib only — not recursive. Its kernels are consumed as source from
-        # the checkout, while platform/extern/{HiCR,TaskR} are only needed by the
-        # meson build in the platform-build job, which checks itself out.
+        # pypto-lib only. Its kernels are consumed as source from the checkout.
         submodules: true
         persist-credentials: false
 
