@@ -54,7 +54,7 @@ def _hosts(local_devices=(0,), remote_devices=(0, 1)) -> tuple[HostSpec, ...]:
     return (
         HostSpec(name="local", devices=tuple(local_devices), port_base=8001,
                  model="/models/Qwen3-14B", served_model_name="qwen"),
-        HostSpec(name="node02", ssh="terra@10.0.0.2", identity_file="/keys/id_ed25519",
+        HostSpec(name="node02", ssh="user@node02", identity_file="/keys/id_ed25519",
                  devices=tuple(remote_devices), port_base=8001,
                  model="/weights/Qwen3-14B", served_model_name="qwen",
                  env={"PYPTO_PROG_BUILD_DIR": "/tmp/build_d{device}"},
@@ -168,7 +168,7 @@ def test_ssh_argv_is_batch_mode_and_uses_the_identity_file():
     # BatchMode: a missing key must fail, not sit on a password prompt.
     assert "BatchMode=yes" in argv
     assert argv[argv.index("-i") + 1] == "/keys/id_ed25519"
-    assert argv[-1] == "terra@10.0.0.2"
+    assert argv[-1] == "user@node02"
 
 
 # --- launching ---

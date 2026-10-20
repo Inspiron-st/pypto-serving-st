@@ -121,7 +121,7 @@ Declare the machines and the devices the router may use:
     },
     {
       "name": "node02",
-      "ssh": "terra@192.168.150.12",
+      "ssh": "user@node02",
       "identity_file": "~/.ssh/id_ed25519",
       "devices": [0, 1, 2, 3],
       "port_base": 8001,
