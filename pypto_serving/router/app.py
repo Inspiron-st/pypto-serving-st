@@ -148,9 +148,16 @@ class ServingRouter:
             return True
         header = request.headers.get("authorization", "")
         scheme, _, token = header.partition(" ")
-        # Constant time: this is the only thing standing in front of a remote
-        # process launch.
-        return scheme.lower() == "bearer" and secrets.compare_digest(token, self._admin_token)
+        if scheme.lower() != "bearer":
+            return False
+        # Constant time, and compared as bytes rather than str: compare_digest
+        # raises TypeError on any non-ASCII character, and the supplied half is
+        # attacker-controlled, so comparing str turns `Bearer <non-ASCII>` into an
+        # unhandled 500 on every admin route instead of a 401 -- and a configured
+        # token with an accented character locks every caller out the same way.
+        return secrets.compare_digest(
+            token.encode("utf-8"), self._admin_token.encode("utf-8")
+        )
 
     @staticmethod
     def _unauthorized() -> JSONResponse:
@@ -349,7 +356,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--health-interval", type=float, default=DEFAULT_HEALTH_INTERVAL_SECONDS,
                         help=f"Seconds between health probes (default: {DEFAULT_HEALTH_INTERVAL_SECONDS:g}).")
     parser.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
-                        help=f"Overall timeout per proxied request (default: {DEFAULT_REQUEST_TIMEOUT_SECONDS:g}s).")
+                        help="Write and connection-pool timeout per proxied request. It is not "
+                             "an overall budget: there is no read timeout, because decode is "
+                             "slow by design, so a replica that sends headers and then stalls "
+                             f"is not bounded by this (default: {DEFAULT_REQUEST_TIMEOUT_SECONDS:g}s).")
     parser.add_argument("--connect-timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT_SECONDS,
                         help=f"Connect timeout per replica (default: {DEFAULT_CONNECT_TIMEOUT_SECONDS:g}s).")
     return parser
@@ -382,6 +392,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}")
         return 1
 
+    # The environment wins: a token on the command line is visible to every local
+    # user through ps and /proc/<pid>/cmdline, and this one is the only thing in
+    # front of a route that launches processes on other machines.
+    #
+    # Deliberately not a bare `or`: an env var that is set but empty -- a deploy
+    # script expanding a variable that was never defined -- would fall through to
+    # --admin-token and, with none given, silently leave those routes open to
+    # anyone who can reach the port. Checked before the banner, so the error is
+    # not buried under a "Starting ..." line the process never honours.
+    env_token = os.environ.get(ADMIN_TOKEN_ENV)
+    if env_token is not None and not env_token.strip():
+        print(f"error: {ADMIN_TOKEN_ENV} is set but empty; unset it or give it a value")
+        return 1
+    admin_token = env_token or args.admin_token
+
     try:
         import uvicorn
     except ImportError as e:
@@ -399,10 +424,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  Pool: launching {config.initial_replicas} of {config.pool_ceiling} slot(s) at startup")
     print(f"  Session TTL: {config.session_ttl_seconds:g}s, affinity slack: {config.affinity_slack}")
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health, /replicas")
-    # The environment wins: a token on the command line is visible to every
-    # local user through ps and /proc/<pid>/cmdline, and this one is the only
-    # thing in front of a route that launches processes on other machines.
-    admin_token = os.environ.get(ADMIN_TOKEN_ENV) or args.admin_token
     if config.hosts and admin_token is None:
         print("  WARNING: /replicas is unauthenticated; it can start processes on other hosts")
     elif args.admin_token is not None and not os.environ.get(ADMIN_TOKEN_ENV):

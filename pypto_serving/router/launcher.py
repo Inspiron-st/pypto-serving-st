@@ -220,7 +220,17 @@ class SshTransport(Transport):
             payload = f"cd {shlex.quote(host.workdir)} && {payload}"
         if detach:
             target = shlex.quote(log_path) if log_path else "/dev/null"
-            payload = f'mkdir -p "$(dirname {target})" 2>/dev/null; nohup {payload} >> {target} 2>&1 &'
+            # The payload goes through `sh -c` rather than straight to nohup.
+            # nohup execs its first argument, and with a workdir the payload
+            # starts with `cd`, which is a shell builtin and not a binary: bare
+            # `nohup cd ... && serve` fails at the cd, the `&&` short-circuits so
+            # the replica never starts, and the trailing `&` still makes ssh exit
+            # 0 -- a launch reported as successful that leaves nothing running and
+            # no log, because the redirect applied to the dead right-hand side.
+            payload = (
+                f'mkdir -p "$(dirname {target})" 2>/dev/null; '
+                f"nohup sh -c {shlex.quote(payload)} >> {target} 2>&1 &"
+            )
         await _run_and_wait([*self.ssh_argv(host), payload])
 
 
@@ -355,7 +365,15 @@ class HostPool:
         # pkill kill its own parent and the replica survives. Writing one
         # character as a class means the pattern no longer matches its own text,
         # while still matching the process we are after.
-        return ["pkill", "-f", f"pypto_serving[.]cli .*--port {slot.port}( |$)"]
+        #
+        # Exit 1 means "no process matched", which for a stop is success: the
+        # replica is already gone, which is exactly the state after a crash
+        # during model load. Only 2 (syntax) and 3 (fatal) are real failures, so
+        # 1 is collapsed into 0 here rather than left for _run_and_wait to call a
+        # LaunchError -- that would report the commonest failed launch as an
+        # unconfirmed stop and reserve its devices for the life of the router.
+        pattern = f"pypto_serving[.]cli .*--port {slot.port}( |$)"
+        return ["sh", "-c", f"pkill -f {shlex.quote(pattern)} || [ $? -eq 1 ]"]
 
     def launch_env(self, slot: Slot) -> dict[str, str]:
         return {
@@ -371,7 +389,14 @@ class HostPool:
                 slot.host, self.launch_argv(slot), self.launch_env(slot),
                 detach=True, log_path=slot.log_path,
             )
-        except LaunchError:
+        except BaseException:
+            # Deliberately not just LaunchError. launch_argv/launch_env expand
+            # {device}/{devices}/{port} templates, so a stray brace in a config
+            # value raises KeyError/ValueError/IndexError right here, and a
+            # cancelled launch raises CancelledError. Any of them must hand the
+            # slot back: otherwise the devices stay taken with nothing running on
+            # them and nothing recording them as owned, so they vanish from
+            # free_slots, from owned, and from unconfirmed_stops at once.
             self.release(slot.name)
             raise
         logger.info(

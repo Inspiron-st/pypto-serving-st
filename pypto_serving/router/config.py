@@ -208,6 +208,37 @@ class RouterConfig:
                 "replica names collide with the slot names these hosts generate: "
                 f"{clashes}"
             )
+        # Addresses as well as names. A static replica and a launchable slot that
+        # resolve to the same host:port are two registry entries for one process,
+        # so its load is double counted and its sessions split -- and stopping the
+        # slot runs the default pkill against that port, killing a replica this
+        # router promised never to stop. Matching is textual, so it catches the
+        # common case rather than every alias of one machine.
+        occupied = {(replica.host, replica.port): replica.name for replica in self.replicas}
+        taken = sorted(
+            f"{host.name}-d{group[0]} would launch on {host.address()}:{host.port_for(group)}, "
+            f"already declared as replica {occupied[(host.address(), host.port_for(group))]!r}"
+            for host in self.hosts
+            for group in host.device_groups()
+            if (host.address(), host.port_for(group)) in occupied
+        )
+        if taken:
+            raise ValueError("; ".join(taken))
+        # And slot against slot: two host entries can describe the same machine --
+        # the same ssh destination, or one declared local and one by address --
+        # which inflates the reported ceiling and puts two replicas on one card.
+        seen: dict[tuple[str, int], str] = {}
+        overlaps: list[str] = []
+        for host in self.hosts:
+            for group in host.device_groups():
+                key = (host.address(), host.port_for(group))
+                slot = f"{host.name}-d{group[0]}"
+                if key in seen:
+                    overlaps.append(f"{slot} and {seen[key]} both map to {key[0]}:{key[1]}")
+                else:
+                    seen[key] = slot
+        if overlaps:
+            raise ValueError("host slots collide on the same address: " + "; ".join(overlaps))
         if self.session_ttl_seconds <= 0:
             raise ValueError("session_ttl_seconds must be positive")
         if self.affinity_slack < 0:

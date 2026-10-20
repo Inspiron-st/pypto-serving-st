@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from pathlib import Path
 
 from pypto_serving.router.config import ReplicaSpec, RouterConfig
@@ -145,7 +146,12 @@ class FleetManager:
         Concurrent, because N model loads in parallel cost one load's wall clock
         rather than N of them.
         """
-        wanted = self._config.initial_replicas
+        # Replicas adopted from a previous run already count towards the request.
+        # Without this the fleet grows by initial_replicas on *every* restart
+        # until it hits the ceiling -- a card per restart on a shared cluster,
+        # each one a fresh model load -- and then reports a spurious
+        # "initial launch failed: PoolExhausted" for a perfectly healthy adoption.
+        wanted = self._config.initial_replicas - len(self._owned)
         if wanted <= 0:
             return []
         results = await asyncio.gather(
@@ -282,7 +288,12 @@ class FleetManager:
         }
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            self._state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            # Temp file plus os.replace, because write_text truncates before it
+            # writes: a crash mid-write would leave a half-written file, and
+            # surviving a crash is the only reason this file exists.
+            tmp = self._state_path.with_name(self._state_path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp, self._state_path)
         except OSError as exc:
             logger.warning("could not write fleet state to %s: %s", self._state_path, exc)
 
@@ -302,14 +313,42 @@ class FleetManager:
             logger.warning("ignoring unreadable fleet state %s: %s", self._state_path, exc)
             return []
 
+        # Everything below is parsed defensively. The file is operator-visible
+        # (--state-file) and may be hand-edited or written by another version, and
+        # adopt_previous is awaited from the lifespan with no handler: an
+        # AttributeError or ValueError here does not degrade to "no adoption", it
+        # stops the router from starting at all.
+        if not isinstance(recorded, dict):
+            logger.warning("ignoring fleet state %s: not a JSON object", self._state_path)
+            return []
+        entries = recorded.get("replicas", [])
+        if not isinstance(entries, list):
+            logger.warning("ignoring fleet state %s: 'replicas' is not a list", self._state_path)
+            return []
+
         adopted: list[str] = []
-        for entry in recorded.get("replicas", []):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                logger.warning("ignoring a malformed entry in %s: %r", self._state_path, entry)
+                continue
             name = entry.get("slot")
             if not isinstance(name, str) or self._registry.state(name) is not None:
                 continue
-            spec = ReplicaSpec(
-                name=name, host=entry.get("address", ""), port=int(entry.get("port", 0)),
-            )
+            address = entry.get("address", "")
+            try:
+                port = int(entry.get("port", 0))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "ignoring %s from the previous run: invalid port %r",
+                    name, entry.get("port"),
+                )
+                continue
+            if not isinstance(address, str):
+                logger.warning(
+                    "ignoring %s from the previous run: invalid address %r", name, address
+                )
+                continue
+            spec = ReplicaSpec(name=name, host=address, port=port)
             if not spec.host or not spec.port:
                 continue
             checker = probe if probe is not None else self._probe

@@ -28,6 +28,7 @@ from pypto_serving.router.launcher import (
     LaunchError,
     PoolExhausted,
     SshTransport,
+    _run_and_wait,
 )
 from pypto_serving.router.routing import ReplicaRegistry, SessionDirectory
 
@@ -854,3 +855,200 @@ def test_a_confirmed_stop_still_frees_the_slot():
     assert stopped is True
     assert capacity["unconfirmed_stops"] == []
     assert "local-d0" in capacity["free_slots"]
+
+
+# --- regressions: the failures the fake transport could not express ----------
+
+
+def test_the_default_stop_tolerates_a_replica_that_is_already_gone():
+    """pkill exits 1 when nothing matched, which for a stop means success.
+
+    A replica that crashed during its model load leaves nothing to kill, so
+    reading that exit as a failed stop is what reserved its devices for the life
+    of the router -- the commonest failed launch, permanently losing a card.
+    """
+    host = HostSpec(name="node", devices=(0,), port_base=8001, model="/m")
+    pool = HostPool(RouterConfig(hosts=(host,)))
+    slot = pool.allocate()
+    argv = pool.stop_argv(slot)
+    # The tolerance has to live in the command: _run_and_wait turns any non-zero
+    # exit into a LaunchError and never exposes the code to its caller.
+    assert argv[:2] == ["sh", "-c"]
+    assert "pkill -f" in argv[2]
+    assert "[ $? -eq 1 ]" in argv[2]
+
+    async def nothing_matches():
+        # The idiom, against a pattern guaranteed to match nothing. Exercising it
+        # with the real pattern would risk killing a developer's own replica.
+        # The character class is the same self-avoidance the production pattern
+        # uses: `pkill -f` reads every command line including this shell's own,
+        # which carries the pattern verbatim, so a literal one makes pkill SIGTERM
+        # its own parent and the command comes back as exit -15.
+        await _run_and_wait(
+            ["sh", "-c", "pkill -f no-such-process-xyzz[y] || [ $? -eq 1 ]"]
+        )
+
+    asyncio.run(nothing_matches())
+
+
+def test_a_detached_ssh_launch_changes_directory_inside_a_shell():
+    """``nohup cd DIR && serve`` never starts anything.
+
+    nohup execs its first argument and ``cd`` is a shell builtin with no binary,
+    so the cd fails, the ``&&`` short-circuits, and the trailing ``&`` still
+    makes ssh exit 0 -- a launch reported as successful that leaves no process
+    and no log, because the redirect applied to the dead right-hand side.
+    """
+    host = HostSpec(
+        name="node", ssh="user@host", devices=(0,), model="/m",
+        workdir="/opt/pypto-serving",
+    )
+    pool = HostPool(RouterConfig(hosts=(host,)))
+    slot = pool.allocate()
+    payload = None
+
+    async def capture(argv):
+        nonlocal payload
+        payload = argv[-1]
+
+    asyncio.run(_payload_of(SshTransport(), host, pool, slot, capture))
+    assert "nohup cd " not in payload, "nohup cannot exec a shell builtin"
+    assert "nohup sh -c " in payload
+    assert "cd /opt/pypto-serving" in payload
+
+
+def test_a_template_typo_in_env_returns_the_slot_to_the_pool():
+    """A stray brace raises KeyError from str.format, not LaunchError.
+
+    Releasing the slot only on LaunchError left the devices taken with nothing
+    running on them and nothing recording them as owned, so they vanished from
+    free_slots, owned and unconfirmed_stops at once -- invisible capacity loss.
+    """
+    host = HostSpec(
+        name="node", devices=(0, 1), port_base=8001, model="/m",
+        # Ordinary Ascend setup. ${...} is not a {device} placeholder.
+        env={"LD_LIBRARY_PATH": "/usr/local/Ascend/lib64:${LD_LIBRARY_PATH}"},
+    )
+    manager, _registry, _fake = _fleet(hosts=(host,))
+
+    with pytest.raises(KeyError):
+        asyncio.run(manager.launch_one())
+
+    assert manager.pool.in_use == 0
+    assert [slot.name for slot in manager.pool.free_slots()] == ["node-d0", "node-d1"]
+
+
+def test_launch_initial_counts_the_replicas_already_owned():
+    """Adoption satisfies --initial-replicas rather than adding to it.
+
+    _lifespan adopts a previous run's replicas and only then launches, so
+    counting just the configured number grew the fleet by one card on every
+    restart until it reached the ceiling, each one a fresh model load.
+    """
+    manager, _registry, _fake = _fleet(initial=1)
+
+    async def scenario():
+        await manager.launch_one()  # stands in for a replica adopted on restart
+        return await manager.launch_initial()
+
+    assert asyncio.run(scenario()) == []
+    assert len(manager.owned_names) == 1
+
+
+def test_a_non_ascii_bearer_token_is_rejected_rather_than_crashing():
+    """secrets.compare_digest raises TypeError on non-ASCII *str* arguments.
+
+    The supplied half is attacker-controlled, so comparing str turned
+    `Authorization: Bearer <any non-ASCII>` into an unhandled 500 with a
+    traceback on every route that launches processes on other machines.
+    """
+    from pypto_serving.router.app import ServingRouter
+
+    class _Client:
+        async def aclose(self):
+            pass
+
+    router = ServingRouter(
+        RouterConfig(hosts=_hosts(), initial_replicas=0),
+        client_factory=lambda _c: _Client(),
+        transport_factory=lambda _host: _FakeTransport(),
+        admin_token="s3cret",
+    )
+    response = asyncio.run(router._add_replica(_AdminRequest({"authorization": "Bearer tökén"})))
+    assert response.status_code == 401
+
+
+def test_an_empty_admin_token_env_var_is_refused_rather_than_ignored(tmp_path, monkeypatch):
+    """`os.environ.get(...) or args.admin_token` treats "" as absent.
+
+    A deploy script expanding a variable that was never defined would otherwise
+    leave /replicas -- which starts processes on other hosts -- open to anyone.
+    """
+    import uvicorn
+
+    from pypto_serving.router.app import ADMIN_TOKEN_ENV, main
+
+    fleet = tmp_path / "fleet.json"
+    fleet.write_text(json.dumps({"hosts": [{"name": "n", "devices": [0], "model": "/m"}]}))
+    monkeypatch.setenv(ADMIN_TOKEN_ENV, "")
+
+    # main() must refuse *before* it serves. Without this guard a regression does
+    # not fail the test, it binds 0.0.0.0:8000 and hangs the whole suite until the
+    # runner's timeout -- so the serve call is stubbed and asserted unreached.
+    served = []
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append(True))
+
+    assert main(["--replicas", str(fleet)]) == 1
+    assert served == [], "the router started serving with an empty admin token"
+
+
+@pytest.mark.parametrize("contents", [
+    "null",
+    '{"replicas": "node-d0"}',
+    '{"replicas": ["node-d0"]}',
+    '{"replicas": [{"slot": "node-d0", "address": "h", "port": "8001x"}]}',
+    '{"replicas": [{"slot": "node-d0", "address": "h", "port": null}]}',
+])
+def test_a_malformed_state_file_is_ignored_rather_than_fatal(tmp_path, contents):
+    """adopt_previous is awaited from the lifespan with no handler.
+
+    Anything it raises stops the router from starting, so a state file that is
+    valid JSON but structurally wrong -- hand-edited, or written by another
+    version -- must degrade to "nothing adopted", not to a router that will not
+    boot without the file being deleted by hand.
+    """
+    state = tmp_path / "state.json"
+    state.write_text(contents)
+
+    async def answers(_spec):
+        return True
+
+    manager, _registry, _fake = _fleet(state_path=state, probe=answers)
+    assert asyncio.run(manager.adopt_previous()) == []
+
+
+def test_a_slot_may_not_launch_onto_an_address_a_static_replica_holds():
+    """Names were checked, addresses were not.
+
+    Two registry entries for one process double-count its load and split its
+    sessions, and stopping the slot runs the default pkill against that port --
+    killing a replica this router promised never to stop.
+    """
+    with pytest.raises(ValueError, match="already declared as replica"):
+        RouterConfig(
+            replicas=(ReplicaSpec(name="existing", host="127.0.0.1", port=8001),),
+            hosts=(HostSpec(name="node01", devices=(0,), port_base=8001, model="/m"),),
+        )
+
+
+def test_two_hosts_may_not_describe_the_same_machine_and_devices():
+    """Only host *names* were required to be unique.
+
+    Two entries for one machine inflate the reported ceiling and hand the same
+    card to two replicas.
+    """
+    with pytest.raises(ValueError, match="collide on the same address"):
+        RouterConfig(hosts=(
+            HostSpec(name="a", ssh="user@node02", devices=(0, 1), model="/m"),
+            HostSpec(name="b", ssh="user@node02", devices=(0, 1), model="/m"),
+        ))
