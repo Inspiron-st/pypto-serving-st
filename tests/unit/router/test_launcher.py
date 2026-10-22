@@ -22,7 +22,12 @@ import json
 import pytest
 
 from pypto_serving.router.config import HostSpec, ReplicaSpec, RouterConfig
-from pypto_serving.router.fleet import STOP_GRACE_SECONDS, FleetManager
+from pypto_serving.router.fleet import (
+    STOP_GRACE_SECONDS,
+    STOP_UNCONFIRMED,
+    UNREACHABLE_AT_STARTUP,
+    FleetManager,
+)
 from pypto_serving.router.launcher import (
     HostPool,
     LaunchError,
@@ -64,7 +69,8 @@ def _hosts(local_devices=(0,), remote_devices=(0, 1)) -> tuple[HostSpec, ...]:
 
 
 def _fleet(*, initial=0, max_replicas=None, transport=None, state_path=None,
-           hosts=None, replicas=(), drain_timeout=5.0, launch_timeout=5.0, probe=None):
+           hosts=None, replicas=(), drain_timeout=5.0, launch_timeout=5.0, probe=None,
+           alive_probe=None, stop_grace=0.3):
     config = RouterConfig(
         replicas=replicas,
         hosts=_hosts() if hosts is None else hosts,
@@ -79,7 +85,10 @@ def _fleet(*, initial=0, max_replicas=None, transport=None, state_path=None,
     fake = transport if transport is not None else _FakeTransport()
     manager = FleetManager(
         config, registry, transport_factory=lambda _host: fake, state_path=state_path,
-        probe=probe,
+        probe=probe, alive_probe=alive_probe,
+        # Shrunk from 30s: these tests assert what happens at both ends of the
+        # grace period, and waiting it out would dominate the suite.
+        stop_grace=stop_grace,
     )
     return manager, registry, fake
 
@@ -352,7 +361,13 @@ def test_a_live_replica_from_a_previous_run_is_adopted(tmp_path):
     assert restarted.pool.in_use == 1
 
 
-def test_a_dead_replica_from_a_previous_run_is_not_adopted(tmp_path):
+def test_a_replica_from_a_previous_run_that_does_not_answer_is_not_adopted(tmp_path):
+    """Not adopted, but not forgotten either: its slot stays reserved.
+
+    Silence does not prove the process exited -- it may still be loading, or the
+    probe may have hit a blip -- and launching onto those cards is the one
+    outcome that cannot be undone.
+    """
     state_path = tmp_path / "fleet.json"
     first, _, _ = _fleet(initial=1, state_path=state_path)
     asyncio.run(first.launch_initial())
@@ -364,7 +379,8 @@ def test_a_dead_replica_from_a_previous_run_is_not_adopted(tmp_path):
 
     assert asyncio.run(restarted.adopt_previous(never_up)) == []
     assert registry.states == ()
-    assert restarted.pool.in_use == 0
+    assert restarted.pool.in_use == 1
+    assert restarted.capacity()["unconfirmed"] == {"local-d0": UNREACHABLE_AT_STARTUP}
 
 
 def test_adoption_without_a_state_file_is_a_no_op(tmp_path):
@@ -524,7 +540,7 @@ def test_get_replicas_reports_the_fleet_and_what_is_left():
     assert payload["replicas"][0]["owned"] is True
     assert payload["capacity"] == {
         "owned": 1, "ceiling": 3, "free_slots": ["node02-d0", "node02-d1"],
-        "unconfirmed_stops": [],
+        "unconfirmed": {},
     }
 
 
@@ -819,7 +835,7 @@ def test_a_failed_stop_command_keeps_the_slot_reserved():
     stopped, capacity = asyncio.run(scenario())
     assert stopped is False
     assert "local-d0" not in capacity["free_slots"]
-    assert capacity["unconfirmed_stops"] == ["local-d0"]
+    assert capacity["unconfirmed"] == {"local-d0": STOP_UNCONFIRMED}
 
 
 def test_an_endpoint_still_answering_keeps_the_slot_reserved():
@@ -829,7 +845,7 @@ def test_an_endpoint_still_answering_keeps_the_slot_reserved():
         async def always_answers(_spec):
             return True
 
-        fleet, registry, _fake = _fleet(probe=always_answers)
+        fleet, registry, _fake = _fleet(alive_probe=always_answers)
         await fleet.launch_one()
         registry.set_ready("local-d0", True)
         stopped = await fleet.stop("local-d0", drain=False)
@@ -837,7 +853,7 @@ def test_an_endpoint_still_answering_keeps_the_slot_reserved():
 
     stopped, capacity = asyncio.run(scenario())
     assert stopped is False
-    assert capacity["unconfirmed_stops"] == ["local-d0"]
+    assert capacity["unconfirmed"] == {"local-d0": STOP_UNCONFIRMED}
 
 
 def test_a_confirmed_stop_still_frees_the_slot():
@@ -845,7 +861,7 @@ def test_a_confirmed_stop_still_frees_the_slot():
         async def never_answers(_spec):
             return False
 
-        fleet, registry, _fake = _fleet(probe=never_answers)
+        fleet, registry, _fake = _fleet(alive_probe=never_answers)
         await fleet.launch_one()
         registry.set_ready("local-d0", True)
         stopped = await fleet.stop("local-d0", drain=False)
@@ -853,8 +869,241 @@ def test_a_confirmed_stop_still_frees_the_slot():
 
     stopped, capacity = asyncio.run(scenario())
     assert stopped is True
-    assert capacity["unconfirmed_stops"] == []
+    assert capacity["unconfirmed"] == {}
     assert "local-d0" in capacity["free_slots"]
+
+
+# --- the reservation must survive concurrency and restarts -------------------
+#
+# Second review on #254. One invariant, four ways it was lost: a slot stays
+# reserved until the replica that held it is confirmed retired.
+
+
+def test_concurrent_stops_share_one_retirement():
+    """Two DELETEs for the same replica must not retire it twice.
+
+    One retirement each is what lost a slot: the second caller found the
+    registry entry already removed, took that for proof of exit, skipped the
+    wait and released the devices while the first was still watching the
+    endpoint.
+    """
+    async def scenario():
+        answering = {"yes": True}
+
+        async def still_there(_spec):
+            return answering["yes"]
+
+        fleet, registry, fake = _fleet(alive_probe=still_there, stop_grace=5.0)
+        spec = await fleet.launch_one()
+        registry.set_ready(spec.name, True)
+
+        first = asyncio.create_task(fleet.stop(spec.name, drain=False))
+        second = asyncio.create_task(fleet.stop(spec.name, drain=False))
+        await asyncio.sleep(0.2)
+        # Still answering, so neither caller may have freed anything yet.
+        held = fleet.capacity()
+        answering["yes"] = False
+        results = await asyncio.gather(first, second)
+        stops = [argv for _host, argv, _env in fake.calls if "pkill" in " ".join(argv)]
+        return results, held, fleet.capacity(), fleet.owned_names, len(stops)
+
+    results, held, capacity, owned, stops = asyncio.run(scenario())
+    assert held["free_slots"] == ["node02-d0", "node02-d1"], "freed before it was gone"
+    assert results == [True, True]
+    assert stops == 1, "one retirement, not one per caller"
+    assert owned == ()
+    assert capacity["unconfirmed"] == {}
+    assert "local-d0" in capacity["free_slots"]
+
+
+def test_a_late_retirement_leaves_the_replacement_alone():
+    """Cleanup is keyed on the instance, not on the slot name.
+
+    The name is reused by whatever replica comes next, so a retirement that
+    finishes late must not drop the registry entry, or release the devices, of
+    the instance that took its place.
+    """
+    async def scenario():
+        fleet, registry, _fake = _fleet()
+        first = await fleet.launch_one()
+        stale = fleet._owned[first.name]
+        assert await fleet.stop(first.name, drain=False)
+
+        replacement = await fleet.launch_one()
+        assert replacement.name == first.name, "the pool reuses the slot name"
+        current = fleet._owned[replacement.name]
+
+        # The old instance's cleanup fires now, one generation too late.
+        late = fleet._finish_retirement(stale, signalled=True, gone=True)
+        return late, fleet.owned_names, fleet.pool.in_use, registry.state(first.name), (
+            stale.generation, current.generation
+        )
+
+    late, owned, in_use, state, generations = asyncio.run(scenario())
+    assert late is True, "the old instance really did stop"
+    assert owned == ("local-d0",), "but the replacement still owns the slot"
+    assert in_use == 1
+    assert state is not None and state.owned
+    assert generations[0] != generations[1]
+
+
+def test_a_replica_that_answers_503_is_not_confirmed_stopped():
+    """503 is not ready, and not gone either.
+
+    serving answers /health with 503 while its engine is not ready, so a
+    replica whose worker died with its HTTP server up says 503 and still holds
+    its cards. The readiness probe called that an exit and freed the devices.
+    """
+    async def scenario():
+        async def never_ready(_spec):
+            return False
+
+        async def answers_503(_spec):
+            return True
+
+        fleet, registry, _fake = _fleet(probe=never_ready, alive_probe=answers_503)
+        await fleet.launch_one()
+        registry.set_ready("local-d0", True)
+        stopped = await fleet.stop("local-d0", drain=False)
+        return stopped, fleet.capacity()
+
+    stopped, capacity = asyncio.run(scenario())
+    assert stopped is False
+    assert capacity["unconfirmed"] == {"local-d0": STOP_UNCONFIRMED}
+    assert "local-d0" not in capacity["free_slots"]
+
+
+def test_the_router_tells_a_503_apart_from_an_exit():
+    """The two probes the fleet needs, over the same endpoint."""
+    from pypto_serving.router.app import ServingRouter
+
+    class _Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    class _Client:
+        status: int | None = 503
+
+        async def get(self, _url, timeout=None):
+            if self.status is None:
+                raise OSError("connection refused")
+            return _Response(self.status)
+
+        async def aclose(self):
+            pass
+
+    client = _Client()
+    router = ServingRouter(
+        RouterConfig(hosts=_hosts(), initial_replicas=0),
+        client_factory=lambda _c: client,
+        transport_factory=lambda _host: _FakeTransport(),
+    )
+    spec = ReplicaSpec(name="local-d0", host="127.0.0.1", port=8001)
+
+    async def both():
+        return await router._probe_replica(spec), await router._endpoint_answers(spec)
+
+    assert asyncio.run(both()) == (False, True), "503: not serving, but still there"
+    client.status = 200
+    assert asyncio.run(both()) == (True, True)
+    client.status = None
+    assert asyncio.run(both()) == (False, False), "nothing answered at all"
+
+
+def test_an_unconfirmed_stop_survives_a_restart(tmp_path):
+    """The state file recorded only what was owned.
+
+    So the reservation vanished at exactly the moment it mattered -- a stop that
+    could not be confirmed -- and the next run saw free devices that an old
+    process may still have held.
+    """
+    state_path = tmp_path / "fleet.json"
+
+    async def first_run():
+        transport = _FakeTransport()
+        fleet, registry, _ = _fleet(transport=transport, state_path=state_path)
+        await fleet.launch_one()
+        registry.set_ready("local-d0", True)
+        transport.fail = LaunchError("pkill: operation not permitted")
+        return await fleet.stop("local-d0", drain=False)
+
+    assert asyncio.run(first_run()) is False
+    recorded = json.loads(state_path.read_text())["replicas"]
+    assert [(e["slot"], e["state"]) for e in recorded] == [("local-d0", "unconfirmed")]
+
+    restarted, registry, _ = _fleet(initial=1, state_path=state_path)
+
+    async def second_run():
+        async def up(_spec):
+            return True
+
+        adopted = await restarted.adopt_previous(up)
+        launched = await restarted.launch_initial()
+        return adopted, [spec.name for spec in launched]
+
+    adopted, launched = asyncio.run(second_run())
+    assert adopted == [], "nothing to adopt: the replica was told to stop"
+    assert restarted.capacity()["unconfirmed"] == {"local-d0": STOP_UNCONFIRMED}
+    assert "local-d0" not in restarted.capacity()["free_slots"]
+    assert launched == ["node02-d0"], "the next launch went somewhere else"
+    assert registry.state("local-d0") is None
+
+
+def test_a_replica_still_loading_keeps_its_slot_across_a_restart(tmp_path):
+    """A crash during a model load leaves a replica that answers nothing yet.
+
+    uvicorn binds only once the engine is up, so the probe cannot tell it from a
+    replica that is gone. Reserving the slot only when the probe succeeded let
+    launch_initial() put a second replica on those same cards.
+    """
+    state_path = tmp_path / "fleet.json"
+    first, _, _ = _fleet(initial=1, state_path=state_path)
+    asyncio.run(first.launch_initial())
+
+    restarted, registry, _ = _fleet(initial=1, state_path=state_path)
+
+    async def scenario():
+        async def not_yet(_spec):
+            return False
+
+        adopted = await restarted.adopt_previous(not_yet)
+        launched = await restarted.launch_initial()
+        return adopted, [spec.name for spec in launched]
+
+    adopted, launched = asyncio.run(scenario())
+    assert adopted == []
+    assert registry.state("local-d0") is None
+    assert restarted.capacity()["unconfirmed"] == {"local-d0": UNREACHABLE_AT_STARTUP}
+    assert launched == ["node02-d0"], "a second replica landed on the loading one's cards"
+
+
+def test_a_replica_that_answers_but_is_not_ready_is_adopted_as_starting(tmp_path):
+    """Still loading, but far enough along to answer: that one is ours.
+
+    Adopting it unroutable costs nothing -- the health poller promotes it when
+    its model is up -- and leaving it unadopted would hold its slot for a
+    replica that is on its way to serving.
+    """
+    state_path = tmp_path / "fleet.json"
+    first, _, _ = _fleet(initial=1, state_path=state_path)
+    asyncio.run(first.launch_initial())
+
+    async def scenario():
+        async def not_ready(_spec):
+            return False
+
+        async def answering(_spec):
+            return True
+
+        restarted, registry, _ = _fleet(state_path=state_path, alive_probe=answering)
+        adopted = await restarted.adopt_previous(not_ready)
+        return adopted, registry.state("local-d0"), restarted.capacity()
+
+    adopted, state, capacity = asyncio.run(scenario())
+    assert adopted == ["local-d0"]
+    assert state is not None and state.owned and not state.ready
+    assert capacity["owned"] == 1
+    assert capacity["unconfirmed"] == {}
 
 
 # --- regressions: the failures the fake transport could not express ----------
@@ -922,7 +1171,7 @@ def test_a_template_typo_in_env_returns_the_slot_to_the_pool():
 
     Releasing the slot only on LaunchError left the devices taken with nothing
     running on them and nothing recording them as owned, so they vanished from
-    free_slots, owned and unconfirmed_stops at once -- invisible capacity loss.
+    free_slots, owned and unconfirmed at once -- invisible capacity loss.
     """
     host = HostSpec(
         name="node", devices=(0, 1), port_base=8001, model="/m",

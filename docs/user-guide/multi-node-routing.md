@@ -197,7 +197,9 @@ curl -s http://localhost:8000/replicas             # the fleet, and what is left
 
 `DELETE` drains first — the replica stops taking new sessions, its pinned sessions are released so they re-route on their next turn, and only once its in-flight requests finish (or `--drain-timeout`, default 300s, expires) is it stopped.
 
-A slot only returns to the pool once the stop is confirmed: the stop command has to succeed *and* the replica's address has to go quiet within the grace period. If either fails, the replica is out of rotation but its devices are in an unknown state — a dead HTTP endpoint does not prove the serving process and its device workers have exited — so the slot stays reserved, `DELETE` answers `500`, and the slot is listed under `capacity.unconfirmed_stops`. Freeing it is a manual decision: the alternative is launching onto cards another instance may still hold.
+A slot only returns to the pool once the stop is confirmed: the stop command has to succeed *and* the replica's address has to go silent within the grace period. *Any* HTTP answer counts as still there, `503` included — serving answers `/health` with `503` whenever its engine is not ready, so a replica whose worker died with its HTTP server still up is alive and still holding its cards. If either check fails, the replica is out of rotation but its devices are in an unknown state — silence does not prove the serving process and its device workers have exited either — so the slot stays reserved, `DELETE` answers `500`, and the slot is listed under `capacity.unconfirmed` with the reason `stop-unconfirmed`. Freeing it is a manual decision: the alternative is launching onto cards another instance may still hold.
+
+Concurrent `DELETE`s for the same replica share one retirement rather than running one each, and the cleanup is keyed on the instance that was launched, not on the slot name — the name is reused by whatever replica comes next.
 
 Startup output goes to `<log_dir>/<slot>.log` on the machine that runs the replica. A launch is detached, so that file is the only place a failed model load can be diagnosed.
 
@@ -209,7 +211,15 @@ Startup output goes to `<log_dir>/<slot>.log` on the machine that runs the repli
 
 An orderly shutdown (SIGTERM or SIGINT) drains and stops every replica the router launched. Statically listed replicas are left alone — only what it launched, it stops.
 
-A crash runs no shutdown hook, so those replicas keep serving. Pass `--state-file` and the router records what it started; on the next start it probes each recorded endpoint, adopts the ones that answer, and logs the rest as probable orphans still holding a device. That turns a router restart into a round trip rather than a fresh model load per replica.
+A crash runs no shutdown hook, so those replicas keep serving. Pass `--state-file` and the router records what it started; on the next start it takes each recorded device group back **before** probing anything, and only then asks what is on it:
+
+| what answers | what happens |
+|---|---|
+| `/health` is `200` | adopted, routable immediately |
+| anything else answers | adopted unroutable; the health poller promotes it once its model is up |
+| nothing answers | **not** adopted, and the slot stays reserved as `unreachable-at-startup` |
+
+That turns a router restart into a round trip rather than a fresh model load per replica. The last row is the one that matters on a shared cluster: a replica that was still loading when the router died answers nothing yet — uvicorn binds only once the engine is up — and neither does a healthy one behind a blip in the network, so a slot is never handed to a new launch on the strength of a probe that failed. Unresolved reservations are written to the state file too, so a stop that could not be confirmed is still reserved after a restart.
 
 ## Readiness and Failover
 

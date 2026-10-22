@@ -84,7 +84,13 @@ class ServingRouter:
         self.proxy = ReplicaProxy(self.registry, self.client)
         self.health = HealthMonitor(config, self.registry, self.sessions, self.client)
         self._admin_token = admin_token
-        fleet_kwargs = {"state_path": state_path, "probe": self._probe_replica}
+        fleet_kwargs = {
+            "state_path": state_path,
+            # Readiness and liveness are different questions, and the fleet
+            # needs both: see FleetManager._wait_gone.
+            "probe": self._probe_replica,
+            "alive_probe": self._endpoint_answers,
+        }
         if transport_factory is not None:
             fleet_kwargs["transport_factory"] = transport_factory
         self.fleet = FleetManager(config, self.registry, **fleet_kwargs)
@@ -123,7 +129,7 @@ class ServingRouter:
         """
         await self.health.start()
         try:
-            await self.fleet.adopt_previous(self._probe_replica)
+            await self.fleet.adopt_previous()
             await self.fleet.launch_initial()
             yield
         finally:
@@ -133,15 +139,30 @@ class ServingRouter:
             if close is not None:
                 await close()
 
-    async def _probe_replica(self, spec) -> bool:
-        """Is something already serving at this address?"""
+    async def _health_status(self, spec) -> int | None:
+        """The replica's /health status, or None if nothing answered."""
         try:
             response = await self.client.get(
                 f"{spec.base_url}/health", timeout=self.config.connect_timeout_seconds
             )
         except Exception:  # noqa: BLE001 - unreachable is the answer, not an error
-            return False
-        return response.status_code == 200
+            return None
+        return response.status_code
+
+    async def _probe_replica(self, spec) -> bool:
+        """Is a replica *serving* at this address? Readiness, so 200 only."""
+        return (await self._health_status(spec)) == 200
+
+    async def _endpoint_answers(self, spec) -> bool:
+        """Is *anything* still answering at this address? Any status counts.
+
+        Liveness, which is a different question. serving answers /health with
+        503 whenever its engine is not ready, so a replica whose worker died
+        with its HTTP server still up answers 503 while holding its devices.
+        Reading that as readiness is correct; reading it as an exit is how those
+        devices get handed to the next launch.
+        """
+        return (await self._health_status(spec)) is not None
 
     def _authorized(self, request: Request) -> bool:
         if self._admin_token is None:
