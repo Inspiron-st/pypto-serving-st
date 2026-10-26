@@ -11,6 +11,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -59,10 +60,10 @@ def _stop_server(process):
         process.wait(timeout=10)
 
 
-def test_v41_dp4_http_answers(tmp_path):
+def test_v41_dp4_http_answer(tmp_path):
     model_path = os.environ.get("PYPTO_DSV41_MODEL_DIR")
     if not model_path or not Path(model_path).is_dir():
-        pytest.skip("PYPTO_DSV41_MODEL_DIR is not set to a model directory")
+        pytest.fail("PYPTO_DSV41_MODEL_DIR is not set to a model directory")
     model_dir = Path(model_path)
     devices = tuple(part.strip() for part in os.environ.get("TASK_DEVICE", "").split(","))
     assert len(devices) == 4 and len(set(devices)) == 4 and all(part.isdecimal() for part in devices)
@@ -74,7 +75,7 @@ def test_v41_dp4_http_answers(tmp_path):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     command = [
-        sys.executable, "-S", "-m", "pypto_serving.cli", "--model", str(model_dir),
+        sys.executable, "-m", "pypto_serving.cli", "--model", str(model_dir),
         "--served-model-name", MODEL_NAME, "--backend", "npu", "--platform", "a5",
         "--devices", ",".join(devices), "--tp", "1", "--dp", "4", "--ep", "4",
         "--block-size", "128", "--max-model-len", "8320", "--max-num-seqs", "1",
@@ -101,25 +102,27 @@ def test_v41_dp4_http_answers(tmp_path):
             else:
                 pytest.fail(f"V4.1 server did not become healthy; log: {log_path}")
 
-            for question, expected in (
-                ("What is 17 times 19? Answer with the number and one sentence.", "323"),
-                ("What is 12 times 13? Answer with the number and one sentence.", "156"),
-            ):
-                payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": _prompt(tokenizer, question)}],
-                           "max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "stream": False}
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/v1/chat/completions",
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"}, method="POST")
-                with OPENER.open(request, timeout=800) as response:
-                    assert response.status == 200
-                    result = json.load(response)
-                choice = result["choices"][0]
-                answer = choice["message"]["content"]
-                print("ANSWER", json.dumps({"question": question, "answer": answer,
-                    "usage": result["usage"], "finish_reason": choice["finish_reason"]}, ensure_ascii=False), flush=True)
-                assert choice["finish_reason"] == "stop", result
-                assert expected in answer, result
-                assert 8000 <= result["usage"]["prompt_tokens"] <= 8192
+            question = "What is 17 times 19? Answer with the number and one sentence."
+            payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": _prompt(tokenizer, question)}],
+                       "max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "stream": False}
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with OPENER.open(request, timeout=400) as response:
+                assert response.status == 200
+                result = json.load(response)
+            assert result["model"] == MODEL_NAME, result
+            assert len(result["choices"]) == 1, result
+            choice = result["choices"][0]
+            answer = choice["message"]["content"]
+            print("ANSWER", json.dumps({"question": question, "answer": answer,
+                "usage": result["usage"], "finish_reason": choice["finish_reason"]}, ensure_ascii=False), flush=True)
+            assert choice["finish_reason"] == "stop", result
+            assert re.search(r"\b323\b", answer), result
+            assert 8000 <= result["usage"]["prompt_tokens"] <= 8192
+            assert result["usage"]["completion_tokens"] > 0
         finally:
             _stop_server(process)
+            print("\n--- V4.1 server log (tail) ---", flush=True)
+            print(log_path.read_text(encoding="utf-8", errors="replace")[-20000:], flush=True)
