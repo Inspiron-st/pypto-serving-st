@@ -9,7 +9,6 @@
 
 import asyncio
 from collections import deque
-import queue
 from types import SimpleNamespace
 
 import pytest
