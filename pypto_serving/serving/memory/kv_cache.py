@@ -618,6 +618,9 @@ class KvCacheManager:
         partition_counts = {group.num_partitions for group in group_specs}
         if len(partition_counts) != 1:
             raise ValueError("KV cache groups must use the same num_partitions")
+        request_limits = {group.max_requests_per_partition for group in group_specs}
+        if len(request_limits) != 1:
+            raise ValueError("KV cache groups must use the same per-partition request limit")
 
         capacity_slots = None
         if primary_num_blocks is not None:
@@ -851,7 +854,11 @@ class KvCacheManager:
         )
         if partition is not None and not 0 <= partition < self.group_partition_count:
             raise ValueError(f"Invalid cache partition {partition}")
+        request_limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
         for candidate_partition in candidate_partitions:
+            if (request_limit is not None and
+                    sum(owner == candidate_partition for owner in self._group_request_partitions.values()) >= request_limit):
+                continue
             candidate = max_candidate
             for name in selected_names:
                 pool = self._group_pools[name]
@@ -1269,10 +1276,13 @@ class KvCacheManager:
     ) -> list[int]:
         assigned = self._group_request_partitions.get(request_id)
         candidates = [assigned] if assigned is not None else list(range(self.group_partition_count))
+        limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
         return [
             partition
             for partition in candidates
-            if all(
+            if (assigned is not None or limit is None or
+                sum(owner == partition for owner in self._group_request_partitions.values()) < limit)
+            and all(
                 self._additional_group_blocks(pool, request_id, token_count)
                 <= pool.num_free_blocks_in(partition)
                 for pool in self._group_pools.values()

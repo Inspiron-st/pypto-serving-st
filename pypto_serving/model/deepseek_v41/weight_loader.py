@@ -723,9 +723,9 @@ class DecodeWeightLayout:
     tp_size: int = 1
 
     @classmethod
-    def from_lib(cls, abi):
+    def from_lib(cls, abi, *, tp_size):
         return cls(abi.N_LAYERS, abi.KV_SOURCE_COUNT, abi.INDEX_SOURCE_COUNT,
-                   abi.C2A_SOURCE_COUNT, abi.EP_SIZE, abi.TP_SIZE)
+                   abi.C2A_SOURCE_COUNT, abi.EP_SIZE, tp_size)
 
     def __post_init__(self):
         if any(type(n) is not int or n <= 0 for n in (

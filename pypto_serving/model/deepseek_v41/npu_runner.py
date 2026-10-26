@@ -76,7 +76,7 @@ class DecodeCachePlan:
 
 
 def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
-                            request_slots, abi) -> DecodeCachePlan:
+                            request_slots, abi, dp_size) -> DecodeCachePlan:
     """Match scheduler page capacities to decode_fwd's source-sliced pools.
 
     ``abi`` is the imported decode_fwd module from the selected lib revision.
@@ -85,7 +85,7 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
     rank axis; each rank has a private copy of its DP partition's page IDs.
     """
     resolved = validate_cache_groups(tuple(layers), tuple(groups), max_seq_len,
-                                     dp_size=abi.EP_SIZE // abi.TP_SIZE)
+                                     dp_size=dp_size)
     by_name = {group.name: group for group in groups}
     window = by_name[resolved.window]
     if groups[0].name != resolved.window:
@@ -2244,7 +2244,7 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
             compiler, root, topology)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
         kv_sources, index_sources, c2a_sources = _sources(layers)
-        layout = DecodeWeightLayout.from_lib(abi)
+        layout = DecodeWeightLayout.from_lib(abi, tp_size=topology.tp)
         if (layout.layers, layout.kv_sources, layout.index_sources,
                 layout.c2a_sources, layout.world) != (
                     len(layers), len(kv_sources), len(index_sources), len(c2a_sources), topology.world):
@@ -2287,7 +2287,7 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
         cache_plan = plan_decode_cache_pools(
             layers, groups, max_seq_len=max_seq_len,
             primary_num_blocks=groups[0].max_blocks_per_seq,
-            request_slots=1, abi=abi,
+            request_slots=1, abi=abi, dp_size=topology.dp,
         )
         if (runtime.total_kv_pages is not None and
                 runtime.total_kv_pages < cache_plan.primary_num_blocks):

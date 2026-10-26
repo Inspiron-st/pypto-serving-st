@@ -46,6 +46,7 @@ def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int, *,
     groups = tuple(KVCacheGroupSpec(
         name, producers[name], KVCacheSpec(block_size, 16, ratio),
         (max_seq_len + block_size - 1) // block_size, num_partitions=dp_size,
+        max_requests_per_partition=1,
     ) for name, block_size, ratio in (("window", 128, 1), ("c2a", 256, 2), ("c1a", 128, 1)))
     validate_cache_groups(layers, groups, max_seq_len, dp_size=dp_size)
     return groups
@@ -85,7 +86,8 @@ def validate_cache_groups(
         _, block_size, ratio = expected[family]
         if (group.spec.block_size != block_size or group.spec.compress_ratio != ratio
                 or group.spec.storage_block_size != 128 or group.num_partitions != dp_size
-                or group.sliding_window is not None or group.is_eagle_group):
+                or group.sliding_window is not None or group.is_eagle_group
+                or group.max_requests_per_partition != 1):
             raise ValueError(f"V4.1 {family} cache page layout disagrees with the lib ABI")
         required = (max_seq_len + block_size - 1) // block_size
         if (group.max_blocks_per_seq < required
