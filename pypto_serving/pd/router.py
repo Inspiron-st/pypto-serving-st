@@ -18,12 +18,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 import msgspec
+from pydantic import TypeAdapter
 
 from .config import Config, log_context
 from .protocol import Binding, MAX_FRAME, Node, decode
 from .routing import Directory
 
 logger = logging.getLogger("pypto_serving.pd.router")
+_STREAM = TypeAdapter(bool)
 
 
 class Router:
@@ -60,6 +62,8 @@ class Router:
         payload = await request.json()
         if not isinstance(payload, dict):
             raise HTTPException(400, "request must be a JSON object")
+        streaming = _STREAM.validate_python(payload.get("stream", False))
+        payload["stream"] = streaming
         await self.requests.acquire()
         handoff_held = False
         p_task = d_task = response = binding = None
@@ -110,7 +114,7 @@ class Router:
             d_task = asyncio.create_task(self.client.send(self.client.build_request(
                 "POST", endpoints[1].url + request.url.path, json=payload, headers=headers(p)), stream=True))
             # JSON headers follow generation; SSE headers only acknowledge setup.
-            header_timeout = (self.config.handoff_timeout if payload.get("stream", False)
+            header_timeout = (self.config.handoff_timeout if streaming
                               else self.config.request_timeout)
             done, _ = await asyncio.wait((p_task, d_task), return_when=asyncio.FIRST_COMPLETED,
                                          timeout=header_timeout)
@@ -128,7 +132,7 @@ class Router:
                     handoff_held = False
                     self.handoffs.release()
             p_task.add_done_callback(release_handoff)
-            if not payload.get("stream", False):
+            if not streaming:
                 body = await response.aread()
                 await ready()
                 finished = True
