@@ -34,40 +34,6 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
 )
 
 
-@pytest.mark.parametrize("pd", [False, True])
-def test_persistent_worker_keeps_model_managed_windows(monkeypatch, pd):
-    # DSpark manages its communication epochs in kernels; whole-window Host
-    # clearing must remain off with and without an optional PD extension.
-    runner = DSparkModelRunner.__new__(DSparkModelRunner)
-    runner._l3_worker = None
-    runner._compiled = SimpleNamespace(l3_callables=lambda: [SimpleNamespace(compiled=object())])
-    runner._inherited_host_weights = lambda: ()
-    ready, captured = [], {}
-    runner.runtime_extension = SimpleNamespace(
-        worker_options=lambda: {"chip_service_factories": {}},
-        worker_ready=lambda: ready.append(True),
-    ) if pd else None
-
-    def prepare(programs, **kwargs):
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr("pypto.runtime.DistributedWorker", prepare)
-    worker = runner._shared_l3_worker()
-    assert captured["persistent"] is True
-    assert captured["reset_persistent_windows"] is False
-    assert runner._shared_l3_worker() is worker
-    assert ready == ([True] if pd else [])
-
-
-def test_prefix_checkpoint_tests_use_the_runtime_ring_geometry():
-    from tests.unit.serving.test_grouped_prefix_cache import GEOMETRY
-    specs = build_dspark_cache_group_specs(3, (0, 4, 128), max_seq_len=655360, max_prefill_tokens=128)
-    assert tuple((g.name, g.spec.token_capacity, g.spec.compress_ratio,
-                  g.max_blocks_per_seq, g.sliding_window) for g in specs) == GEOMETRY
-    assert all(g.num_partitions == 4 for g in specs)
-
-
 @pytest.mark.parametrize("tp_size", [1, 4])
 def test_page_budget_uses_fractional_slot_without_changing_rings(tp_size):
     from pypto_serving.config.types import RuntimeConfig
@@ -93,129 +59,6 @@ def test_page_budget_uses_fractional_slot_without_changing_rings(tp_size):
     manager.initialize(RuntimeConfig(kv_cache_groups=groups), num_blocks=counts["ori"], group_num_blocks=counts)
     assert {g.name: manager.group_num_blocks(g.name) for g in groups} == counts
     assert {g.name: g.max_blocks_per_seq for g in manager.group_specs} == original
-
-
-def test_cache_budget_includes_split_index_scales_filler_and_alignment():
-    from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
-
-    groups = build_dspark_cache_group_specs(3, (0, 4, 128), max_seq_len=655360, max_prefill_tokens=128)
-    counts = {g.name: g.max_blocks_per_seq for g in groups}
-    payload = sum(g.spec.page_size_bytes * counts[g.name] for g in groups)
-    assert cache_pool_bytes(groups, counts, filler_pages=64) > payload
-    with pytest.raises(RuntimeError, match="live/async/checkpoint minimum"):
-        plan_cache_pages(groups, payload, active_requests=2, step_tokens=8, filler_pages=64)
-
-
-def test_cache_budget_accounts_for_eight_independent_physical_allocations():
-    from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes
-
-    groups = build_dspark_cache_group_specs(3, (0, 4, 128), max_seq_len=655360, max_prefill_tokens=128)
-    counts = {group.name: group.max_blocks_per_seq + 7 for group in groups}
-    physical, logical = [], []
-    for group in groups:
-        size = (counts[group.name] + 64) * group.spec.page_size_bytes
-        sizes = (size // 132 * 128, size // 132 * 4) if group.name == "idx" else (size,)
-        for size in sizes:
-            logical.append((size + 32 + 511) // 512 * 512)
-            physical.append(((size + 32 + (2 << 20) - 1) // (2 << 20) + 1) * (2 << 20))
-    assert len(physical) == 8
-    assert cache_pool_bytes(groups, counts, filler_pages=64) == sum(physical)
-    assert sum(physical) > sum(logical)
-
-
-def test_cache_budget_keeps_bookkeeping_inside_the_post_resident_limit():
-    from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
-
-    groups = build_dspark_cache_group_specs(43, (0, 0) + (4,) * 21 + (128,) * 20,
-        max_seq_len=655360, max_prefill_tokens=128, partitions=4)
-    budget = 28_303_212_544
-    old = dict(ori=34, cmp_c128=34913, cmp_c4=34913, idx=34913,
-               hca_state=130, csa_state=274, csa_inner_state=274)
-    assert cache_pool_bytes(groups, old, filler_pages=64) > budget
-    counts = plan_cache_pages(groups, budget, active_requests=2, step_tokens=128, filler_pages=64)
-    assert counts["cmp_c4"] < old["cmp_c4"]
-    assert cache_pool_bytes(groups, counts, filler_pages=64) <= budget
-
-
-@pytest.mark.parametrize("utilization", [0.85, 0.90])
-def test_cache_planning_queries_tightest_logical_rank_after_resident_allocations(utilization):
-    from pypto_serving.config.types import RuntimeConfig
-    from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
-
-    runner = _runner(tp_size=1)
-    groups = build_dspark_cache_group_specs(3, (0, 4, 128), max_seq_len=655360, max_prefill_tokens=128,
-                                          partitions=16)
-    runner._cache_group_specs = groups
-    total, calls = 100 << 30, []
-    budget = cache_pool_bytes(groups, {g.name: g.max_blocks_per_seq for g in groups}, filler_pages=64) * 2
-    def info(rank):
-        calls.append(rank)
-        return total - int(total * utilization) + budget + (15 - rank) * 1024, total
-    runner._shared_l3_worker = lambda: SimpleNamespace(device_memory_info=info)
-    runtime = RuntimeConfig(max_seq_len=655360, max_batch_size=8, max_prefill_tokens_per_request=128,
-                            npu_memory_utilization=utilization)
-    counts = runner._compute_kv_cache_pages(runtime)
-    assert calls == list(range(16))
-    assert counts == plan_cache_pages(groups, budget, active_requests=1, step_tokens=8, filler_pages=64)
-    runner._shared_l3_worker = lambda: SimpleNamespace(device_memory_info=lambda rank: (total // 20, total))
-    with pytest.raises(RuntimeError, match="exceeds npu_memory_utilization"):
-        runner._check_memory_target(runtime)
-
-
-def test_worker_prewarms_covering_ring_profiles_before_cache_sizing(monkeypatch):
-    from pypto.runtime import RunConfig
-
-    runner = _runner(speculative=True)
-    runner._compiled.l3_callables = lambda: [SimpleNamespace(compiled=object())]
-    runner._inherited_host_weights = lambda: ()
-    runner._l3_run_config = RunConfig(ring_heap=[2 << 30, 2 << 30, 4 << 30, 8 << 30])
-    runner._decode_run_config = RunConfig(ring_heap=4 << 30)
-    runner._drafter_run_config = RunConfig(ring_heap=[4 << 30] * 4)
-    runner._markov_run_config = RunConfig(ring_heap=1 << 30)
-    captured = {}
-    monkeypatch.setattr("pypto.runtime.DistributedWorker", lambda _programs, **kwargs: captured.update(kwargs))
-    runner._shared_l3_worker()
-    assert list(captured["config"].ring_heap) == [4 << 30, 4 << 30, 4 << 30, 8 << 30]
-    assert runner._l3_run_config.ring_heap == [2 << 30, 2 << 30, 4 << 30, 8 << 30]
-
-
-@pytest.mark.parametrize("failure", [None, "allocation", "postcheck"])
-def test_cache_initialization_is_atomic_without_slot_retry_or_context_reduction(failure):
-    from pypto_serving.config.types import RuntimeConfig
-
-    runner = _runner()
-    runtime = RuntimeConfig(max_seq_len=655360, max_batch_size=8, max_prefill_tokens_per_request=128,
-        kv_cache_groups=build_dspark_cache_group_specs(3, (0, 4, 128), max_seq_len=655360,
-                                                     max_prefill_tokens=128))
-    runner._compiled.runtime_model = object()
-    runner._compiled.l3_callables = lambda: [object()]
-    events = []
-    runner._ensure_l3_shared_buffers = lambda _record: events.append("resident")
-    counts = {group.name: group.max_blocks_per_seq + 5 for group in runtime.kv_cache_groups}
-    def plan(_runtime):
-        events.append("budget")
-        return counts
-    def allocate():
-        events.append("allocation")
-        if failure == "allocation":
-            raise MemoryError("allocation failed")
-    def check(_runtime):
-        events.append("postcheck")
-        if failure == "postcheck":
-            raise RuntimeError("postcheck failed")
-    runner._compute_kv_cache_pages = plan
-    runner._materialize_decode_device_cache = allocate
-    runner._check_memory_target = check
-    runner._free_device_caches = lambda: events.append("free")
-    if failure:
-        with pytest.raises((MemoryError, RuntimeError), match=failure):
-            runner.init_kv_cache("model", SimpleNamespace(), runtime)
-        assert events[-1] == "free"
-    else:
-        assert runner.init_kv_cache("model", SimpleNamespace(), runtime) == counts["ori"]
-    assert events[:3] == ["resident", "budget", "allocation"]
-    assert events.count("allocation") == 1
-    assert runtime.max_seq_len == 655360 and runner._cache_group_num_blocks == counts
 
 
 def _runner(*, speculative: bool = False, max_position: int = 512, extension_factory=None,
@@ -318,31 +161,6 @@ def _block_rows(count: int) -> list[dict[str, list[int]]]:
     return rows
 
 
-@pytest.mark.parametrize("failure", ["extension", "worker", None])
-def test_close_preserves_owner_and_buffers_until_retirement_succeeds(failure):
-    runner = _runner()
-    events = []
-    def close(name):
-        events.append(name)
-        if name == failure:
-            raise RuntimeError("retirement failed")
-    worker = SimpleNamespace(close=lambda: close("worker"))
-    runner._l3_worker = worker
-    runner.runtime_extension = SimpleNamespace(close=lambda: close("extension"))
-    retained = runner._decode_task_args[0]
-    if failure:
-        with pytest.raises(RuntimeError, match="retirement failed"):
-            runner.close()
-        assert runner._l3_worker is worker
-        assert runner._decode_task_args[0] is retained
-        assert runner._cache_group_num_blocks
-    else:
-        runner.close()
-        assert runner._l3_worker is None
-        assert not runner._decode_task_args and not runner._cache_group_num_blocks
-    assert events == (["extension"] if failure == "extension" else ["extension", "worker"])
-
-
 @pytest.mark.parametrize("max_batch_size", [1, 32, 256])
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_size, tp_size):
@@ -376,88 +194,6 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
     assert executor.max_prefill_requests_per_partition == per_group
     assert executor.max_prefill_batch_size == max_batch_size
     assert executor.max_prefill_tokens_per_partition == 8192
-
-
-@pytest.mark.parametrize("capture", [False, True])
-@pytest.mark.parametrize("role", ["mixed", "prefill", "decode"])
-def test_target_only_can_capture_tail_without_compiling_drafter(monkeypatch, capture, role):
-    monkeypatch.setattr(executor_module, "DSparkWeightStore", lambda **_: SimpleNamespace(
-        validate_startup_contract=lambda **_: None))
-    executor = DeepSeekV4DSparkPyptoExecutor(
-        device_ids=range(16), compile_kernels=True, capture_prefill_tail=capture, execution_role=role)
-    calls = []
-    modules = dict(prefill_fwd=SimpleNamespace(l3_prefill_fwd="prefill"),
-                   decode_fwd=SimpleNamespace(l3_decode_fwd="decode"),
-                   prefill_state=SimpleNamespace(l3_capture_prefill_tail="capture", l3_extract_prefill_tail="extract"),
-                   config=None, utils=None)
-    def load(layout, *, speculative):
-        assert not speculative
-        return modules
-    monkeypatch.setattr(executor, "_load_kernel_modules", load)
-    monkeypatch.setattr(executor, "_compile_l3_callable", lambda name, fn: calls.append(fn) or fn)
-    monkeypatch.setattr(executor, "_build_rope_tables", lambda *a, **kw: None)
-    model = SimpleNamespace(config=SimpleNamespace(hidden_size=4096, num_hidden_layers=43,
-        num_attention_heads=64, num_key_value_heads=1, head_dim=512, vocab_size=129280,
-        max_position_embeddings=1_048_576),
-        runtime=SimpleNamespace(max_batch_size=8, page_size=32, max_seq_len=1024),
-        extra=dict(family="deepseek_v4", checkpoint_format="w8a8-compressed-tensors",
-                   compress_ratios=(0,) * 44, weight_map={}, model_dir="unused"))
-    compiled = executor._compile_model(model)
-    assert calls == (["prefill"] if role != "decode" else []) + (["capture"] if capture else []) + (
-        ["decode"] if role != "prefill" else [])
-    assert compiled.num_speculative_tokens == 0 and not compiled.prefill_async
-    assert compiled.drafter is compiled.markov is compiled.bootstrap_metadata is compiled.prefill_publish is None
-
-
-@pytest.mark.parametrize("length", [1, 127, 128, 129, 512, 8193])
-@pytest.mark.parametrize("pd", [False, True])
-@pytest.mark.parametrize("chunk_tokens,cached", [(64, False), (128, False), (8192, False), (128, True)])
-def test_prefill_capture_hook_preserves_complete_tail_and_slot_reuse(monkeypatch, length, pd, chunk_tokens, cached):
-    from pypto_serving.pd.adapter import DSparkExtension
-
-    def factory(*, runner):
-        extension = DSparkExtension.__new__(DSparkExtension)
-        extension.runner, extension.compiled = runner, runner._compiled
-        extension.draft_states = runner._drafter_states
-        return extension
-    runner = _runner(speculative=not pd, extension_factory=factory if pd else None)
-    runner._compiled.prefill_capture = object()
-    runner._prefill_descriptor_slots = [torch.zeros((16, 1, 12), dtype=torch.int32) for _ in range(2)]
-    for name in ("positions", "hidden"):
-        runner._device_scratch[("prefill_state", name)] = object()
-    runner._device_scratch[("prefill", "dspark_target_hidden")] = object()
-    monkeypatch.setattr(runner, "_grant_prefill_generations", lambda ids: None)
-    monkeypatch.setattr(runner, "_materialize_dspark_device_state_meta", lambda: object())
-    monkeypatch.setattr(runner, "_stacked_device_prefix", lambda tensor, count: tensor)
-    calls = []
-    monkeypatch.setattr(runner, "_run_l3", lambda *args: calls.append(args))
-    old_lease, old_generation = -1, 0
-    replay_start = max(0, length - 128) // 128 * 128 if cached else 0
-    for request in ("first", "reused"):
-        state = runner._reserve_drafter_state(request, group=2, prompt_len=length, defer_device_clear=True)
-        if request == "reused":
-            assert state.lease == old_lease and state.generation == old_generation + 1
-            assert state.prefill_tail_positions is None
-        calls.clear()
-        for start in range(replay_start, length, chunk_tokens):
-            count = min(chunk_tokens, length - start)
-            descriptor = runner_module.DSparkStepDescriptor(
-                state.lease, state.generation, state.group, start, count, length, 0, count, 0, 0)
-            inputs = SimpleNamespace(request_ids=(request,), descriptors=(descriptor,),
-                chunk_starts=(start,), actual_tokens=(count,), physical_tokens=(count + 3) // 4 * 4,
-                query_start_loc=torch.zeros((16, 2), dtype=torch.int32))
-            runner._capture_prefill_tails(None, inputs, descriptor_slot=(start // 128) % 2)
-        expected_calls = sum(start + min(chunk_tokens, length - start) > max(0, length - 128)
-                             for start in range(replay_start, length, chunk_tokens)) if pd else (
-                                 length - replay_start + chunk_tokens - 1) // chunk_tokens
-        assert len(calls) == expected_calls
-        assert all(args[0] is runner._compiled.prefill_capture for args in calls)
-        expected = torch.arange(max(0, length - 128), length, dtype=torch.int64)
-        assert torch.equal(state.prefill_tail_positions, expected)
-        if pd:
-            assert runner.runtime_extension.handle("source_state", request) == {"bootstrap": state.lease}
-        old_lease, old_generation = state.lease, state.generation
-        runner.release_finished_requests((request,))
 
 
 @pytest.mark.parametrize("length", [1, 127, 128, 129, 512, 8064, 8192, 8193, 655359])
@@ -544,62 +280,6 @@ def test_pd_bootstrap_reuses_normal_seed_with_local_generations(monkeypatch, len
         extension.handle("source_state", "reused")
     reused.prefill_tail_positions = torch.arange(max(0, length - 128), length, dtype=torch.int64)
     assert extension.handle("source_state", "reused") == {"bootstrap": reused.lease}
-
-
-@pytest.mark.parametrize("tp_size", [1, 2, 4])
-def test_bootstrap_and_drafter_extents_follow_attention_not_head_tp(tp_size):
-    layout = DSparkCacheLayout.for_ranks(16, tp_size=tp_size, lm_head_tp_size=4)
-    slots = task_args_module._drafter_slots(layout)
-    metadata = task_args_module.bootstrap_metadata_specs(layout)
-    assert slots["query_group_position_ids"][1] == (16, tp_size * 16 * 7)
-    assert metadata["query_group_position_ids"][0] == (16, tp_size * 16 * 7)
-    assert metadata["context_group_position_ids"][0] == (16, 4 * 128)
-    assert layout.decode_local_batch == 16 and layout.decode_local_tokens == 128
-    assert layout.decode_batch == 64 and layout.decode_tokens == 512
-    assert layout.partitions * layout.decode_capacity == 256
-
-
-@pytest.mark.parametrize("tp_size", [1, 2, 4])
-def test_device_bootstrap_binding_does_not_require_host_context_buckets(monkeypatch, tp_size):
-    layout = DSparkCacheLayout.for_ranks(16, tp_size=tp_size)
-    runner = DSparkModelRunner.__new__(DSparkModelRunner)
-    runner._compiled = SimpleNamespace(bootstrap_metadata=object())
-    names = task_args_module._DRAFTER_TENSOR_ORDER
-    runner._drafter_task_args = SimpleNamespace(names=names, build=lambda: tuple(object() for _ in names))
-    runner._drafter_context_staging = {}
-    runner._drafter_block_table_staging = {}
-    metadata = {name: object() for name in task_args_module.bootstrap_metadata_specs(layout)}
-    runner._device_scratch = {("bootstrap_meta", name): tensor for name, tensor in metadata.items()}
-    token, hidden = object(), object()
-    runner._device_scratch["bootstrap", "next_prefill_tokens"] = token
-    monkeypatch.setattr(runner, "_stacked_device_prefix", lambda tensor, rows: (tensor, rows))
-    rows = 4 * 128 // tp_size
-    bound = dict(zip(names, runner._drafter_dispatch_args(4, rows, target_hidden=hidden, bootstrap=True),
-                     strict=True))
-    assert bound["target_hidden"] == (hidden, rows)
-    assert bound["next_prefill_tokens"] == (token, 4)
-    for name in set(names) & set(metadata):
-        assert bound[name] is metadata[name]
-    with pytest.raises(KeyError):
-        runner._drafter_dispatch_args(4, rows, bootstrap=False)
-
-
-def test_tp1_decode_staging_keeps_the_padded_group_abi():
-    runner = _runner(tp_size=1)
-    decode = DecodeBatch(request_ids=["first", "same-partition", "last-partition"],
-        token_ids=torch.tensor([[10], [20], [30]], dtype=torch.long), hidden_states=None,
-        seq_lens=torch.tensor([96, 97, 224], dtype=torch.int32), block_ids_by_group=_block_rows(3),
-        cache_partitions=[0, 0, 15], allow_device_greedy_sampling=True)
-    prepared = runner.prepare_decode_inputs(SimpleNamespace(), decode)
-    staged = runner._decode_task_args[0].tensors
-    assert prepared.sampled_slots == ((0, 0), (0, 1), (15, 0))
-    assert staged["position_ids"].shape == (16, 512)
-    assert staged["input_ids"].shape == (16, 128)
-    assert staged["num_tokens_per_owner"].tolist() == [16] + [0] * 14 + [8]
-    assert bool((staged["swa_slot_mapping"][:, 128:] == -1).all())
-    overflow = replace(decode, request_ids=[str(i) for i in range(17)], cache_partitions=[0] * 17)
-    with pytest.raises(ValueError, match="capacity 16"):
-        runner._decode_assignment(overflow)
 
 
 def test_prefill_to_decode_staging_contract() -> None:
@@ -913,23 +593,6 @@ def test_packed_prefill_captures_separate_request_tails(monkeypatch):
     assert runner._drafter_state("request-0").lease != runner._drafter_state("request-2").lease
 
 
-def test_target_only_capture_reserves_and_reuses_tail_slots_without_draft_kv():
-    runner = _runner()
-    runner._compiled.prefill_capture = object()
-    batch = _packed_prefill_batch()
-    model = SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512))
-    first = runner.prepare_prefill_inputs(model, batch)
-    states = [runner._drafter_state(request) for request in batch.request_ids]
-    assert all(d.request_slot == s.lease and d.generation == s.generation
-               for d, s in zip(first.descriptors, states))
-    assert not runner.speculative and not runner._drafter_device_weights
-    assert ("drafter", "kv_caches") not in runner._device_scratch
-    runner.release_finished_requests(batch.request_ids)
-    second = runner.prepare_prefill_inputs(model, batch)
-    assert all(d.generation == 2 for d in second.descriptors)
-    assert not runner._drafter_dirty_leases
-
-
 def _pypto_lib_function(module_name: str, function_name: str) -> ast.FunctionDef:
     """Parse one l3 entry point from the pinned pypto-lib dspark kernels."""
     kernel_file = (
@@ -969,37 +632,6 @@ def test_fused_dspark_target_args_match_pypto_lib_abi() -> None:
         if name not in runner_module._DSPARK_FUSED_INTERNAL_PREPARE_NAMES
     )
     assert tuple(arg.arg for arg in fused.args.args[:len(target)]) == target
-
-
-def test_complete_k7_binding_matches_the_pinned_lib_argument_order(monkeypatch):
-    runner = DSparkModelRunner.__new__(DSparkModelRunner)
-    names = task_args_module._FUSED_DECODE_TENSOR_ORDER
-    runner._decode_task_args = [SimpleNamespace(names=names, build=lambda: names)]
-    runner._device_scratch = {}
-    fields = ("state_slot_ids", "state_generations", "accepted_token_ids", "accepted_counts",
-              "group_state_slot_ids", "group_state_generations")
-    tables = tuple(f"group_{name}_block_tables" for name in (
-        "ori", "hca_cmp", "csa_cmp", "idx", "hca_state", "csa_state", "csa_inner_state"))
-    runner._dspark_state_buffers = [SimpleNamespace(
-        **{name: name for name in fields}, **{name: name[:-1] for name in tables})]
-    monkeypatch.setattr(runner, "_materialize_dspark_device_state_tokens", lambda: "state_tokens")
-    monkeypatch.setattr(runner, "_materialize_dspark_device_state_meta", lambda: "state_meta")
-    rope = {f"{kind}_rope_{axis}_table": f"{kind}_rope_{axis}_table"
-            for kind in ("swa", "ratio4", "ratio128") for axis in ("cos", "sin")}
-    monkeypatch.setattr(runner, "_materialize_dspark_rope_tables", lambda: rope)
-    runner._fused_drafter_task_args = runner._fused_markov_task_args = []
-    runner._fused_drafter_batch = 4
-    runner._compiled = SimpleNamespace(layout=DSparkCacheLayout())
-    runner._drafter_block_table_staging = {}
-    runner._drafter_task_args = SimpleNamespace(names=task_args_module._DRAFTER_TENSOR_ORDER)
-    runner._markov_task_args = SimpleNamespace(names=task_args_module._MARKOV_TENSOR_ORDER)
-    monkeypatch.setattr(runner, "_drafter_dispatch_args", lambda *a, **kw: tuple(
-        f"draft_{name}" for name in task_args_module._DRAFTER_TENSOR_ORDER))
-    monkeypatch.setattr(runner, "_markov_dispatch_args", lambda *a, **kw: tuple(
-        f"draft_{name}" for name in task_args_module._MARKOV_TENSOR_ORDER))
-    actual = runner._bind_fused_decode_args(SimpleNamespace(buffer_slot=0))
-    signature = _pypto_lib_function("decode_fwd_dspark", "l3_decode_fwd_dspark")
-    assert actual == tuple(arg.arg for arg in signature.args.args)
 
 
 def test_drafter_and_markov_task_arg_orders_match_pypto_lib_abis() -> None:

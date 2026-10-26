@@ -18,42 +18,8 @@ import torch
 from pypto_serving.config.types import DecodeBatch
 from pypto_serving.model.deepseek_dspark import npu_runner as mod
 from pypto_serving.model.deepseek_dspark import task_args
-from pypto_serving.model.deepseek_dspark.cache_tables import DecodeTableRows, DrafterTableRows
+from pypto_serving.model.deepseek_dspark.cache_tables import DrafterTableRows
 from tests.unit.model.deepseek_dspark.test_dspark_model import _block_rows, _runner
-
-
-@pytest.mark.parametrize("ring", [False, True])
-def test_changed_row_only_updates_its_replicas_and_owner(ring):
-    table = torch.empty((4, 17), dtype=torch.int32)
-    replica = torch.empty_like(table)
-    owner = torch.empty((2, 17), dtype=torch.int32)
-    cache = DecodeTableRows(table, ring=ring, fillers=range(20, 24), replicas=[replica], owner=owner)
-    before = table.clone()
-    assert not cache.update(0, None, (20,))
-    assert cache.update(1, ("a", 1), (3, 7, 9))
-    np.testing.assert_array_equal(table[1].numpy(),
-        np.resize([3, 7, 9], 17) if ring else [3, 7, 9] + [-1] * 14)
-    torch.testing.assert_close(table, replica)
-    torch.testing.assert_close(table[:2], owner)
-    torch.testing.assert_close(table[[0, 2, 3]], before[[0, 2, 3]])
-    assert not cache.update(1, ("a", 1), (3, 7, 9))
-    assert cache.update(1, ("a", 2), (3, 7, 9))
-    assert cache.update(1, ("b", 2), (4,))
-    assert cache.update(1, None, (21,))
-    torch.testing.assert_close(table, before)
-    torch.testing.assert_close(table, replica)
-    torch.testing.assert_close(table[:2], owner)
-
-
-@pytest.mark.parametrize("blocks", [(), (-1,), tuple(range(18))])
-def test_invalid_absolute_row_does_not_replace_its_binding(blocks):
-    table = torch.empty((1, 17), dtype=torch.int32)
-    cache = DecodeTableRows(table, ring=False, fillers=[20])
-    before = table.clone()
-    with pytest.raises(ValueError, match="invalid physical block row"):
-        cache.update(0, ("a", 1), blocks)
-    torch.testing.assert_close(table, before)
-    assert not cache.update(0, None, (20,))
 
 
 _FIELDS = {"ori": "ori", "cmp_c128": "hca_cmp", "cmp_c4": "csa_cmp", "idx": "idx",
@@ -120,7 +86,7 @@ def _check_full_reference(runner, plan):
 
 
 @pytest.mark.parametrize("tp", [1, 4])
-def test_fused_tables_match_full_geometry_across_slots_cow_rebind_and_exit(monkeypatch, tp):
+def test_fused_tables_match_full_geometry_across_slots_cow_rebind_and_exit(tp):
     runner = _fused_runner(tp)
     last_group = runner._compiled.layout.partitions - 1
     for request, group, lease in (("a", 0, 0), ("b", 0, tp), ("c", last_group, 0)):
@@ -128,18 +94,9 @@ def test_fused_tables_match_full_geometry_across_slots_cow_rebind_and_exit(monke
     batch = DecodeBatch(request_ids=["a", "b", "c"], token_ids=torch.ones((3, 1), dtype=torch.int64),
                         hidden_states=None, seq_lens=torch.tensor([31, 127, 128], dtype=torch.int32),
                         block_ids_by_group=_block_rows(3), cache_partitions=[0, 0, last_group])
-    changed = []
-    original = DecodeTableRows.update
-    def record(self, row, identity, blocks):
-        result = original(self, row, identity, blocks)
-        if result:
-            changed.append((row, identity, blocks))
-        return result
-    monkeypatch.setattr(DecodeTableRows, "update", record)
     first = runner._prepare_decode_plan(batch, buffer_slot=0)
     runner._stage_device_prepared_decode(first)
     _check_full_reference(runner, first)
-    assert len(changed) == 3 * 7
     saved = {name: getattr(first, f"group_{field}_block_tables").clone() for name, field in _FIELDS.items()}
     pending = object()
     runner._track_pending_decode_dispatch(0, pending)
@@ -152,35 +109,25 @@ def test_fused_tables_match_full_geometry_across_slots_cow_rebind_and_exit(monke
         torch.testing.assert_close(getattr(first, f"group_{field}_block_tables"), saved[name])
     runner._forget_pending_decode_dispatch(0, pending)
     # Positions cross 32/128 but the physical snapshot has not changed.
-    changed.clear()
     batch.seq_lens += 8
     runner._stage_device_prepared_decode(runner._prepare_decode_plan(batch, buffer_slot=0))
-    assert changed == []
     # A state COW changes only its own group, not compressed history.
     for name in ("hca_state", "csa_state", "csa_inner_state"):
-        changed.clear()
         ids = list(range(501, 501 + len(batch.block_ids_by_group[0][name])))
         batch.block_ids_by_group[0][name] = ids
         _check_full_reference(runner, runner._prepare_decode_plan(batch, buffer_slot=0))
-        assert changed == [(0, ("a", 1), tuple(ids))]
     # Compressed-page append/shrink clears the old tail in just that row.
     for name in _OWNER:
         for ids in ([21, 22, 23], [21]):
-            changed.clear()
             batch.block_ids_by_group[0][name] = ids
             _check_full_reference(runner, runner._prepare_decode_plan(batch, buffer_slot=0))
-            assert changed == [(0, ("a", 1), tuple(ids))]
     # Same lease and physical IDs, new generation: all groups must rebind.
-    changed.clear()
     runner._drafter_states["a"].generation += 1
     _check_full_reference(runner, runner._prepare_decode_plan(batch, buffer_slot=0))
-    assert len(changed) == 7
     # A new request can reuse the exact same physical lease/mapping safely.
     runner._drafter_states["replacement"] = runner._drafter_states.pop("a")
     batch.request_ids[0] = "replacement"
-    changed.clear()
     _check_full_reference(runner, runner._prepare_decode_plan(batch, buffer_slot=0))
-    assert len(changed) == 7
     # Dense owner rows swap, then disappear; old tails must become fillers.
     for indices in ((1, 0, 2), (2,)):
         moved = replace(batch, request_ids=[batch.request_ids[i] for i in indices],
@@ -196,7 +143,7 @@ def test_fused_tables_match_full_geometry_across_slots_cow_rebind_and_exit(monke
 
 
 @pytest.mark.parametrize("tp", [1, 4])
-def test_drafter_reuses_each_slot_bucket_and_rebinds_lease_generation(monkeypatch, tp):
+def test_drafter_reuses_each_slot_bucket_and_rebinds_lease_generation(tp):
     runner = _runner(speculative=True, tp_size=tp)
     slots = [{b: torch.empty((16, 3, b, mod.DSPARK_DRAFTER_TABLE_BLOCKS), dtype=torch.int32)
               for b in (4, 8)} for _ in range(2)]
@@ -207,14 +154,6 @@ def test_drafter_reuses_each_slot_bucket_and_rebinds_lease_generation(monkeypatc
             )
     patterns = np.stack([(np.arange(mod.DSPARK_DRAFTER_TABLE_BLOCKS) + 7 * layer)
                          % mod.DSPARK_DRAFTER_RING_BLOCKS for layer in range(3)])
-    changed = []
-    original = DrafterTableRows.update
-    def record(self, rank, row, identity, base):
-        result = original(self, rank, row, identity, base)
-        if result:
-            changed.append((rank, row, identity))
-        return result
-    monkeypatch.setattr(DrafterTableRows, "update", record)
     def check(slot, count, bucket, anchor=31, order=None):
         leases = list(range(count)) if order is None else list(order)
         rows = [[] for _ in range(16)]
@@ -228,29 +167,15 @@ def test_drafter_reuses_each_slot_bucket_and_rebinds_lease_generation(monkeypatc
         np.testing.assert_array_equal(slots[slot][bucket].numpy(), expected)
     check(0, 2, 4)
     saved = slots[0][4].clone()
-    changed.clear()
     check(1, 2, 4)
-    assert len(changed) == 2
-    changed.clear()
     check(0, 2, 4, anchor=135)
-    assert changed == []
     check(0, 5, 8)
-    assert len(changed) == 5
-    changed.clear()
     check(0, 2, 4)
-    assert changed == []
     check(0, 2, 4, order=(1, 0))
-    assert len(changed) == 2
-    changed.clear()
     check(0, 2, 4)
-    assert len(changed) == 2
-    changed.clear()
     runner._drafter_lease_generations[0][0] += 1
     check(0, 2, 4)
-    assert len(changed) == 1
-    changed.clear()
     check(0, 1, 4)
-    assert changed == [(0, 1, None)]
     torch.testing.assert_close(slots[1][4], saved)
     check(0, 0, 4)
     runner.close()

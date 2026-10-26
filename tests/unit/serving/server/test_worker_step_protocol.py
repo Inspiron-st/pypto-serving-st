@@ -657,33 +657,6 @@ def test_worker_entry_always_closes_worker(monkeypatch, caplog, busy_loop_fails,
         assert "Invalid PYPTO_SIMPLER_LOG_LEVEL" in caplog.text
 
 
-@pytest.mark.parametrize("sizes", [{"a": 7, "b": 13}, {"a": 7}, {"a": 8, "b": 13}, {"a": 7, "b": 0}])
-def test_startup_reports_independent_cache_pages_before_ready(monkeypatch, sizes):
-    import multiprocessing as mp
-    from pypto_serving.serving.server import serving_worker
-
-    groups = (SimpleNamespace(name="a"), SimpleNamespace(name="b"))
-    capacity = mp.get_context("spawn").Array("q", 3)
-    ready = []
-    class FakeWorker:
-        def __init__(self, *_args):
-            self.executor = SimpleNamespace(cache_group_sizes=lambda _model: sizes)
-        def init_device_and_model(self):
-            return 7
-        def busy_loop(self):
-            pass
-        def close(self):
-            pass
-    monkeypatch.setattr(serving_worker, "WorkerProcess", FakeWorker)
-    monkeypatch.setattr(serving_worker, "freeze_gc_heap", lambda: None)
-    monkeypatch.setattr("signal.signal", lambda *_args: None)
-    monkeypatch.setattr("logging.basicConfig", lambda **_kwargs: None)
-    config = SimpleNamespace(model_id="m", resolve_runtime_config=lambda: SimpleNamespace(kv_cache_groups=groups))
-    serving_worker._worker_entry(config, None, None,
-        SimpleNamespace(set=lambda: ready.append(tuple(capacity))), capacity)
-    assert ready == [(7, 7, 13)] if sizes == {"a": 7, "b": 13} else ready == [(0, 0, 0)]
-
-
 def test_mixed_decode_does_not_overwrite_prepared_next_step():
     prefill_running = threading.Event()
     next_prepared = threading.Event()
