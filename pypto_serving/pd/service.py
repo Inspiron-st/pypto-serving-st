@@ -110,17 +110,38 @@ class Service:
         if digest(payload) != binding.input_digest:
             raise ValueError("HTTP input differs from routed request")
         entry = self.entry(binding)
+        if entry.cancelled:
+            raise ValueError("request cancelled")
         if entry.http.is_set():
             raise ValueError("duplicate generation POST")
         entry.http.set()
         return entry
 
+    def remember_terminal(self, binding):
+        previous = self.terminal.get(binding.request)
+        if previous is not None and previous != binding:
+            raise ValueError("terminal binding mismatch")
+        self.terminal[binding.request] = binding
+        self.terminal.move_to_end(binding.request)
+        while len(self.terminal) > self.config.capacity * 8:
+            self.terminal.popitem(last=False)
+
+    async def cancel_binding(self, binding):
+        binding.check(self.node, self.role)
+        entry = self.requests.get(binding.request)
+        if entry is None:
+            # An abort can overtake both the generation POST and control begin.
+            # Keep a bounded tombstone without allocating an active request slot.
+            self.remember_terminal(binding)
+        else:
+            if entry.binding != binding:
+                raise ValueError("abort binding mismatch")
+            await self.abort(entry)
+
     def finish(self, entry):
         if self.requests.pop(entry.binding.request, None) is None:
             return
-        self.terminal[entry.binding.request] = entry.binding
-        while len(self.terminal) > self.config.capacity * 8:
-            self.terminal.popitem(last=False)
+        self.remember_terminal(entry.binding)
         logger.info("finished request=%s cancelled=%s error=%s p_hit=%d d_hit=%d", entry.binding.request,
                     entry.cancelled, entry.error, entry.p_hit,
                     entry.reservation.prefix_hit_tokens if entry.reservation is not None else 0)
@@ -196,11 +217,10 @@ class Service:
             raise ValueError("control sender differs from binding")
         if operation == "abort" and payload.get("stopped") is True:
             binding.check(self.node, self.role)
-            if binding.request not in self.requests and (
-                binding.request not in self.terminal or self.terminal[binding.request] == binding
-            ):
+            if binding.request not in self.requests:
                 # Never admitted (including a capacity rejection): no write
                 # could be authorized, and abort must not allocate a new slot.
+                self.remember_terminal(binding)
                 return {}
         entry = self.entry(binding)
         request = binding.request

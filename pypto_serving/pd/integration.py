@@ -87,12 +87,7 @@ class Server(ServingServer):
 
     async def abort(self, request: HTTPRequest):
         binding = decode(await request.json(), Binding)
-        binding.check(self.service.node, self.service.role)
-        entry = self.service.requests.get(binding.request)
-        if entry is not None:
-            if entry.binding != binding:
-                raise ValueError("abort binding mismatch")
-            await self.service.abort(entry)
+        await self.service.cancel_binding(binding)
         return JSONResponse(dict(accepted=True))
 
     async def _completions(self, request: HTTPRequest):

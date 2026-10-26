@@ -77,8 +77,12 @@ class Router:
                                            self.config.handoff_timeout)
                 except asyncio.TimeoutError:
                     pass  # Node-side leases remain gated until positive native proof.
-            if response is not None:
-                await response.aclose()
+            received = response
+            if received is None and d_task is not None and d_task.done() and not d_task.cancelled():
+                if d_task.exception() is None:
+                    received = d_task.result()
+            if received is not None:
+                await received.aclose()
             if handoff_held:
                 handoff_held = False
                 self.handoffs.release()
