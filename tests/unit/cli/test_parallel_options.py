@@ -153,18 +153,18 @@ def test_generate_config_defaults_to_greedy(options):
     assert config.temperature == 0.0
 
 
-def test_dspark_topology_accepts_the_8_card_and_16_card_worlds():
-    # The DSpark serving topology is TP4 with expert parallelism spanning the
-    # whole world: --ep is the rank count (16 in production, 8 on a half
-    # node) and --dp is the derived scheduler-partition count.
-    for dp, ep in ((2, 8), (4, 16)):
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_dspark_topology_accepts_the_8_card_and_16_card_worlds(tp):
+    # Attention TP determines cache partitions; expert parallelism spans the world.
+    for ep in (8, 16):
+        dp = ep // tp
         devices = ",".join(str(device) for device in range(ep))
         args = _parse_cli_args(
             [
                 "--model", "model",
                 "--dp", str(dp),
                 "--ep", str(ep),
-                "--tp", "4",
+                "--tp", str(tp),
                 "--devices", devices,
                 "--block-size", "32",
                 "--max-num-seqs", "8",
