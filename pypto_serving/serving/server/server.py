@@ -773,6 +773,7 @@ class ServingServer:
         kwargs = self._chat_kwargs(request.chat_template_kwargs, request.reasoning_effort)
         thinking = bool(
             kwargs.get("thinking", False) or kwargs.get("enable_thinking", False)
+            or kwargs.get("thinking_mode") == "thinking"
         ) and kwargs.get("reasoning_effort") != "none"
         return OutputParserSpec(
             parser_id=str(parser_id),

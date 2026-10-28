@@ -131,6 +131,9 @@ class KVCacheGroupSpec:
     # states, including the final pending row. Earlier rows in a large chunk
     # must not be published as complete prefix-cache pages.
     prefill_tail_tokens: int | None = None
+    # Some kernels have request state for fewer sequences than their KV pages
+    # could fit. Limit active owners per partition before assigning pages.
+    max_requests_per_partition: int | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -141,6 +144,8 @@ class KVCacheGroupSpec:
             raise ValueError("KV cache num_blocks must be positive when specified")
         if self.num_partitions <= 0:
             raise ValueError("KV cache num_partitions must be positive")
+        if self.max_requests_per_partition is not None and self.max_requests_per_partition <= 0:
+            raise ValueError("KV cache max_requests_per_partition must be positive")
         if self.prefill_tail_tokens is not None:
             if self.prefill_tail_tokens <= 0 or not self.is_eagle_group:
                 raise ValueError("KV cache prefill_tail_tokens requires a positive EAGLE tail extent")
