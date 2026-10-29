@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import replace
 
 import torch
 
@@ -30,6 +31,16 @@ from pypto_serving.serving.memory.kv_cache import KvCacheManager
 
 class ModelExecutor(ABC):
     """Backend-neutral interface used by the serving worker to execute generation."""
+
+    @classmethod
+    def resolve_runtime_config(cls, runtime, device_ids):
+        """Apply model-owned runtime requirements before worker startup."""
+        return runtime
+
+    @classmethod
+    def configure_engine(cls, config):
+        """Apply model-owned placement and scheduler limits."""
+        return replace(config, runtime_config=config.resolve_runtime_config())
 
     def __init__(self, kv_cache_manager: KvCacheManager | None = None) -> None:
         """Store the KV cache manager shared with the engine (optional for serving path)."""
@@ -91,6 +102,17 @@ class ModelExecutor(ABC):
         preparation independent from any decode invocation currently executing.
         The worker may call :meth:`prepare_decode` on its command thread while
         :meth:`run_prepared_decode` is running on the device thread.
+        """
+        return False
+
+    @property
+    def supports_async_decode_prepare_without_embeddings(self) -> bool:
+        """Allow decode preparation before the input token embeddings are known.
+
+        Prepared metadata must be independent of placeholder tokens and accept
+        ``hidden_states=None``. Execution must bind the real token embeddings
+        after the worker resolves the preceding output token. This capability
+        does not imply that embedding lookup runs on the device.
         """
         return False
 

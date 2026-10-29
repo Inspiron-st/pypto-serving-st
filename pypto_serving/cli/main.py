@@ -25,6 +25,7 @@ from pypto_serving.config.types import (
     GenerateConfig,
     RuntimeConfig,
 )
+from pypto_serving.model.common.executor import resolve_executor_cls
 from pypto_serving.model.model_family import detect_model_family, read_model_config
 from pypto_serving.observability.access_log import create_uvicorn_log_config
 from pypto_serving.serving.utils.env import (
@@ -306,7 +307,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         enable_expert_parallel=args.expert_parallel_size > 1,
         devices=devices,
         data_parallel_routing=args.data_parallel_routing,
-        placement_mode="overlapped" if model_family == "deepseek_v4" else "replica",
+        placement_mode="overlapped" if model_family in ("deepseek_v4", "glm53") else "replica",
     )
     _validate_model_topology(
         model_family,
@@ -324,7 +325,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         num_speculative_tokens > 1 and model_variant != "dspark"
     ):
         enable_prefix_cache = False
-    return EngineConfig(
+    config = EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
         platform=args.platform,
@@ -345,6 +346,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
     )
+    return resolve_executor_cls(config.executor_cls).configure_engine(config)
 
 
 def _build_v41_engine_config(args, model_dir, raw, devices):
@@ -712,6 +714,8 @@ def _executor_cls_for_model_family(model_family: str, *, variant: str = "") -> s
     """Map model family metadata to the worker executor class id."""
     if model_family == "deepseek_v41":
         return "PyptoDeepSeekV41Executor"
+    if model_family == "glm53":
+        return "PyptoGlm53Executor"
     if model_family == "deepseek_v4":
         if variant == "dspark":
             return "PyptoDeepSeekV4DSparkExecutor"
@@ -749,6 +753,8 @@ def _validate_model_topology(
     variant: str = "",
 ) -> None:
     """Validate model-specific serving topology constraints."""
+    if model_family == "glm53" and (args.block_size != 128 or args.dtype != "bfloat16"):
+        raise ValueError("GLM W8A8 serving requires --block-size 128 --dtype bfloat16")
     if model_family != "deepseek_v4":
         return
     if variant == "dspark":
